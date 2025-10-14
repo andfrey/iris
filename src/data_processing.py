@@ -7,116 +7,465 @@ import pandas as pd
 import numpy as np
 from sklearn.datasets import load_iris
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler
-import joblib
 import os
 import h5py
-import cv2
+import json
+import hashlib
 from skimage.measure import regionprops, label
 from skimage.io import imread
 from tqdm import tqdm
 from scipy import ndimage
 from typing import Optional, Union, Dict, List, Tuple, Generator, Any
-import sys
 from abc import ABC, abstractmethod
+from functools import lru_cache, partial
 
 # PyTorch imports
-try:
-    import torch
-    from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader
+import lightning as L
+from torch.utils.data import random_split
+from datetime import datetime
+import traceback
+import importlib
 
-    PYTORCH_AVAILABLE = True
-except ImportError:
-    print("Warnung: PyTorch nicht installiert. Fallback auf custom DataLoader.")
-    PYTORCH_AVAILABLE = False
-
-    # Mock classes für Kompatibilität
-    class Dataset:
-        pass
-
-    class DataLoader:
-        pass
+import yaml
 
 
-try:
-    import basicpy
-except ImportError:
-    print("Warnung: basicpy nicht installiert. Beleuchtungskorrektur nicht verfügbar.")
-    basicpy = None
+def resolve(name: str):
+    module_name, attr_name = name.rsplit(".", 1)
+    module = importlib.import_module(module_name)
+    return getattr(module, attr_name)
 
 
-class BaseDataLoader(ABC):
-    """Abstrakte Basisklasse für alle DataLoader."""
+class H5DataCleaner:
+    """
+    Analyzes H5 dataset and creates quality metadata file with valid cells.
 
-    @abstractmethod
-    def load_batch(self, batch_size: int) -> Generator[Dict, None, None]:
-        """Lädt Daten in Batches als Generator."""
-        pass
+    Filtering criteria:
+    1. Cells without exactly 3 planes per channel
+    2. Cells with multiple objects in segmentation (multiple cells)
+    3. Cells where segmentation failed (empty mask)
+    4. Cells where nuclei_seg is 1.2x or larger than cell seg
 
-    @abstractmethod
-    def get_item_count(self) -> int:
-        """Gibt die Anzahl der verfügbaren Items zurück."""
-        pass
+    Results are cached in a metadata file that includes the filtering criteria.
+    If the same analysis is run again with the same criteria, results are loaded from cache.
+    """
+
+    def __init__(
+        self, h5_file_path: str, nuclei_threshold: float = 1.2, max_objects: int = 1
+    ):
+        """
+        Initialize the cleaner.
+
+        Args:
+            h5_file_path: Path to H5 file
+            nuclei_threshold: Threshold ratio for nuclei/cell area (default 1.2)
+            max_objects: Maximum allowed objects in segmentation (default 1)
+        """
+        self.h5_file_path = h5_file_path
+        self.nuclei_threshold = nuclei_threshold
+        self.max_objects = max_objects
+
+        self.relevant_channels = ["405", "488", "561", "bf"]
+
+        # Statistics
+        self.stats = {
+            "total_cells": 0,
+            "invalid_plane_count": 0,
+            "multiple_cells": 0,
+            "failed_segmentation": 0,
+            "nuclei_too_large": 0,
+            "valid_cells": 0,
+        }
+
+        # Detailed results
+        self.invalid_cells = {
+            "invalid_plane_count": [],
+            "multiple_cells": [],
+            "failed_segmentation": [],
+            "nuclei_too_large": [],
+        }
+        self.valid_cells = []
+
+    def _get_criteria_hash(self) -> str:
+        """
+        Generate a hash of the filtering criteria.
+        Used to identify cached metadata files.
+        """
+        criteria_str = (
+            f"planes3_maxobj{self.max_objects}_nucthresh{self.nuclei_threshold:.2f}"
+        )
+        return hashlib.md5(criteria_str.encode()).hexdigest()[:8]
+
+    def _get_metadata_filename(self) -> str:
+        """
+        Generate filename for metadata based on criteria.
+        Format: <h5_basename>_quality_<criteria_hash>.json
+        """
+        base_name = os.path.splitext(self.h5_file_path)[0]
+        criteria_hash = self._get_criteria_hash()
+        return f"{base_name}_quality_{criteria_hash}.json"
+
+    def _find_existing_metadata(self) -> Optional[str]:
+        """
+        Check if a metadata file with matching criteria exists.
+
+        Returns:
+            Path to metadata file if found, None otherwise
+        """
+        metadata_path = self._get_metadata_filename()
+
+        if not os.path.exists(metadata_path):
+            return None
+
+        # Validate that the metadata is for the same file version
+        try:
+            with open(metadata_path, "r") as f:
+                metadata = json.load(f)
+
+            # Check file hash to ensure H5 file hasn't changed
+            stat = os.stat(self.h5_file_path)
+            current_hash = hashlib.md5(
+                f"{self.h5_file_path}_{stat.st_size}_{stat.st_mtime}".encode()
+            ).hexdigest()
+
+            if metadata.get("file_hash") == current_hash:
+                # Check criteria match
+                stored_criteria = metadata.get("filtering_criteria", {})
+                if (
+                    stored_criteria.get("nuclei_to_cell_threshold")
+                    == self.nuclei_threshold
+                    and stored_criteria.get("max_objects_in_segmentation")
+                    == self.max_objects
+                ):
+                    return metadata_path
+
+            print(f"⚠ Found metadata but it's outdated or has different criteria")
+            return None
+
+        except Exception as e:
+            print(f"⚠ Error reading metadata file: {e}")
+            return None
+
+    def _load_cached_metadata(self, metadata_path: str) -> Dict[str, Any]:
+        """Load and return cached metadata."""
+        with open(metadata_path, "r") as f:
+            metadata = json.load(f)
+
+        # Update internal state from metadata
+        self.valid_cells = metadata.get("valid_cells", [])
+        self.invalid_cells = metadata.get("invalid_cells", {})
+        self.stats = metadata.get("statistics", {})
+
+        return metadata
+
+    def check_plane_count(self, cell_group: h5py.Group) -> bool:
+        """Check if cell has exactly 3 planes per channel."""
+        for channel in self.relevant_channels:
+            if channel not in cell_group:
+                continue
+
+            n_planes = len(list(cell_group[channel].keys()))
+            if n_planes != 3:
+                return False
+
+        return True
+
+    def check_multiple_cells(
+        self, mask: np.ndarray, max_objects: int = 1
+    ) -> Tuple[bool, int]:
+        """Check if segmentation mask contains multiple objects."""
+        if mask is None or mask.size == 0:
+            return True, 0
+
+        # Label connected components
+        labeled_mask = label(mask)
+        num_objects = labeled_mask.max()
+
+        return num_objects <= max_objects, num_objects
+
+    def check_segmentation_failed(self, mask: np.ndarray) -> bool:
+        """Check if segmentation failed (empty mask)."""
+        if mask is None:
+            return True
+
+        return np.sum(mask > 0) == 0
+
+    def compare_segmentation_areas(
+        self, cell_seg: np.ndarray, nuclei_seg: np.ndarray
+    ) -> Tuple[bool, float, float]:
+        """Compare areas of cell vs nuclei segmentation."""
+        if cell_seg is None or nuclei_seg is None:
+            return False, 0, 0
+
+        cell_area = np.sum(cell_seg > 0)
+        nuclei_area = np.sum(nuclei_seg > 0)
+
+        # Check if nuclei is larger than threshold
+        is_too_large = nuclei_area > (self.nuclei_threshold * cell_area)
+
+        return is_too_large, nuclei_area, cell_area
+
+    def validate_cell(self, cell_group: h5py.Group, cell_name: str) -> Tuple[bool, str]:
+        """Validate a single cell against all criteria."""
+        # 1. Check plane count
+        if not self.check_plane_count(cell_group):
+            return False, "invalid_plane_count"
+
+        # Get middle plane for segmentation checks
+        plane_names = sorted(list(cell_group[self.relevant_channels[0]].keys()))
+        if len(plane_names) < 3:
+            return False, "invalid_plane_count"
+
+        middle_plane = plane_names[len(plane_names) // 2]
+
+        # Load segmentation masks for middle plane
+        cell_seg = None
+        nuclei_seg = None
+
+        if "seg" in cell_group and middle_plane in cell_group["seg"]:
+            cell_seg = cell_group["seg"][middle_plane][()]
+
+        if "nuclei_seg" in cell_group and middle_plane in cell_group["nuclei_seg"]:
+            nuclei_seg = cell_group["nuclei_seg"][middle_plane][()]
+
+        # 2. Check if segmentation failed
+        if self.check_segmentation_failed(cell_seg):
+            return False, "failed_segmentation"
+
+        # 3. Check for multiple cells
+        is_single_cell, num_objects = self.check_multiple_cells(cell_seg, max_objects=1)
+        if not is_single_cell:
+            return False, f"multiple_cells"
+
+        # 4. Check if nuclei is too large compared to cell
+        if nuclei_seg is not None and cell_seg is not None:
+            nuclei_too_large, nuclei_area, cell_area = self.compare_segmentation_areas(
+                cell_seg, nuclei_seg
+            )
+            if nuclei_too_large:
+                return False, "nuclei_too_large"
+
+        return True, "valid"
+
+    def analyze(
+        self, show_progress: bool = True, force_reanalyze: bool = False
+    ) -> Dict[str, Any]:
+        """
+        Analyze the dataset and categorize cells.
+        Checks for cached metadata first, only re-analyzes if cache doesn't exist or force_reanalyze=True.
+
+        Args:
+            show_progress: Whether to show progress bar
+            force_reanalyze: Force re-analysis even if cached metadata exists
+
+        Returns:
+            Dictionary with analysis results and metadata
+        """
+        # Check for cached metadata first
+        if not force_reanalyze:
+            cached_path = self._find_existing_metadata()
+            if cached_path:
+                print(f"✓ Found cached metadata: {cached_path}")
+                metadata = self._load_cached_metadata(cached_path)
+                self.print_statistics()
+                return metadata
+
+        print(f"Analyzing dataset: {self.h5_file_path}")
+
+        with h5py.File(self.h5_file_path, "r") as f:
+            all_cells = list(f.keys())
+            self.stats["total_cells"] = len(all_cells)
+
+            print(f"Total cells in dataset: {len(all_cells):,}")
+
+            iterator = (
+                tqdm(all_cells, desc="Analyzing cells", unit="cell")
+                if show_progress
+                else all_cells
+            )
+
+            for cell_name in iterator:
+                if cell_name not in f:
+                    continue
+
+                cell_grp = f[cell_name]
+                is_valid, reason = self.validate_cell(cell_grp, cell_name)
+
+                if is_valid:
+                    self.valid_cells.append(cell_name)
+                    self.stats["valid_cells"] += 1
+                else:
+                    # Categorize invalid cells
+                    if reason == "invalid_plane_count":
+                        self.invalid_cells["invalid_plane_count"].append(cell_name)
+                        self.stats["invalid_plane_count"] += 1
+                    elif reason == "multiple_cells":
+                        self.invalid_cells["multiple_cells"].append(cell_name)
+                        self.stats["multiple_cells"] += 1
+                    elif reason == "failed_segmentation":
+                        self.invalid_cells["failed_segmentation"].append(cell_name)
+                        self.stats["failed_segmentation"] += 1
+                    elif reason == "nuclei_too_large":
+                        self.invalid_cells["nuclei_too_large"].append(cell_name)
+                        self.stats["nuclei_too_large"] += 1
+
+        # Print statistics
+        self.print_statistics()
+
+        # Create metadata
+        stat = os.stat(self.h5_file_path)
+        file_hash = hashlib.md5(
+            f"{self.h5_file_path}_{stat.st_size}_{stat.st_mtime}".encode()
+        ).hexdigest()
+        criteria_hash = self._get_criteria_hash()
+
+        metadata = {
+            "h5_file_path": self.h5_file_path,
+            "file_hash": file_hash,
+            "file_size_bytes": stat.st_size,
+            "file_mtime": stat.st_mtime,
+            "analysis_date": datetime.now().isoformat(),
+            "criteria_hash": criteria_hash,
+            "filtering_criteria": {
+                "require_3_planes": True,
+                "max_objects_in_segmentation": self.max_objects,
+                "reject_empty_segmentation": True,
+                "nuclei_to_cell_threshold": self.nuclei_threshold,
+            },
+            "statistics": self.stats,
+            "valid_cells": self.valid_cells,
+            "invalid_cells": self.invalid_cells,
+        }
+
+        # Auto-save metadata to cache file
+        metadata_path = self._get_metadata_filename()
+        with open(metadata_path, "w") as f:
+            json.dump(metadata, f, indent=2)
+        print(f"\n✓ Metadata saved to: {metadata_path}")
+
+        return metadata
+
+    def print_statistics(self):
+        """Print analysis statistics."""
+        print("\n" + "=" * 60)
+        print("DATASET QUALITY ANALYSIS")
+        print("=" * 60)
+        print(f"Total cells:                {self.stats['total_cells']:,}")
+        print(f"Valid cells:                {self.stats['valid_cells']:,}")
+        print(f"\nInvalid cells by reason:")
+        print(f"  - Invalid plane count:    {self.stats['invalid_plane_count']:,}")
+        print(f"  - Multiple cells:         {self.stats['multiple_cells']:,}")
+        print(f"  - Failed segmentation:    {self.stats['failed_segmentation']:,}")
+        print(f"  - Nuclei too large:       {self.stats['nuclei_too_large']:,}")
+        print(
+            f"\nTotal invalid:              {self.stats['total_cells'] - self.stats['valid_cells']:,}"
+        )
+        print(
+            f"Retention rate:             {100 * self.stats['valid_cells'] / max(self.stats['total_cells'], 1):.1f}%"
+        )
+        print("=" * 60)
+
+    def save_metadata(self, output_path: str = None) -> str:
+        """
+        Save quality metadata to JSON file.
+
+        Args:
+            output_path: Path to save metadata (default: auto-generate)
+
+        Returns:
+            Path to saved metadata file
+        """
+        if output_path is None:
+            # Auto-generate filename
+            base_name = os.path.splitext(self.h5_file_path)[0]
+            output_path = f"{base_name}_quality_metadata.json"
+
+        metadata = self.analyze(show_progress=True)
+
+        print(f"\nSaving metadata to: {output_path}")
+        with open(output_path, "w") as f:
+            json.dump(metadata, f, indent=2)
+
+        print(f"✓ Metadata saved successfully")
+        return output_path
 
 
 class H5CellDataset(Dataset):
     """
-    PyTorch Dataset für H5-Zellbilddaten.
-    Ermöglicht die Verwendung mit PyTorch DataLoader für optimierte Performance.
+    PyTorch Dataset für H5-Zellbilddaten mit automatischer Qualitätsprüfung.
+
+    Verwendet H5DataCleaner um ungültige Zellen zu filtern.
+    Ergebnisse werden automatisch in einer Metadaten-Datei gecacht.
+
+    Args:
+        h5_file_path: Path to H5 file
+        transform: Optional transform for input images (e.g., ImagePreprocessor)
+        target_transform: Optional transform for output/targets (e.g., FUCCIRepresentationTransform)
+        use_quality_filter: Enable quality filtering
+        nuclei_threshold: Threshold for nuclei/cell size ratio
+        max_objects: Max objects in segmentation
+        force_reanalyze: Force re-analysis even if cache exists
     """
 
     def __init__(
         self,
         h5_file_path: str,
-        preprocessor: Optional["ImagePreprocessor"] = None,
-        feature_extractor: Optional["FeatureExtractor"] = None,
-        return_features: bool = True,
-        return_raw: bool = False,
-        channels: Optional[List[str]] = None,
+        transform: Optional[Any] = None,
+        target_transform: Optional[Any] = None,
+        feature_extractor: Optional[Any] = None,
+        use_quality_filter: bool = True,
+        nuclei_threshold: float = 1.2,
+        max_objects: int = 1,
+        force_reanalyze: bool = False,
     ):
         """
         Args:
             h5_file_path: Pfad zur H5-Datei
-            preprocessor: ImagePreprocessor für Bildverarbeitung
-            feature_extractor: FeatureExtractor für Feature-Extraktion
-            return_features: Ob Features zurückgegeben werden sollen
-            return_raw: Ob Rohdaten zusätzlich zurückgegeben werden sollen
-            channels: Liste der zu ladenden Kanäle (default: alle)
+            transform: Optional transform for input images (applied to raw images)
+            target_transform: Optional transform for targets/labels (applied to outputs)
+            nuclei_threshold: Threshold für Nuclei/Cell Größenverhältnis (default 1.2)
+            max_objects: Max. erlaubte Objekte in Segmentierung (default 1)
+            use_quality_filter: Wenn True, führe Qualitätsfilter durch (default True)
+            force_reanalyze: Erzwinge Neuanalyse auch wenn Cache existiert (default False)
         """
-        if not PYTORCH_AVAILABLE:
-            raise ImportError(
-                "PyTorch ist nicht installiert. Installieren Sie es mit: pip install torch"
-            )
-
         super().__init__()
 
         self.h5_file_path = h5_file_path
-        self.preprocessor = preprocessor
+        self.transform = transform
+        self.target_transform = target_transform
         self.feature_extractor = feature_extractor
-        self.return_features = return_features
-        self.return_raw = return_raw
-        self.channels = channels
+        self.nuclei_threshold = nuclei_threshold
+        self.max_objects = max_objects
 
         if not os.path.exists(h5_file_path):
             raise FileNotFoundError(f"H5-Datei nicht gefunden: {h5_file_path}")
 
-        # Sammle Zellnamen
-        with h5py.File(h5_file_path, "r") as f:
-            self.cell_names = list(f.keys())
-
-        # Validiere dass Features oder Raw-Daten angefordert werden
-        if not return_features and not return_raw:
-            raise ValueError(
-                "Mindestens return_features oder return_raw muss True sein"
+        # Load cell names using quality filter or all cells
+        if use_quality_filter:
+            # Use H5DataCleaner to filter cells (with automatic caching)
+            print(
+                f"Using quality filter with nuclei_threshold={nuclei_threshold}, max_objects={max_objects}"
             )
-
-        print(f"H5CellDataset initialisiert: {len(self.cell_names)} Zellen")
+            cleaner = H5DataCleaner(
+                h5_file_path, nuclei_threshold=nuclei_threshold, max_objects=max_objects
+            )
+            metadata = cleaner.analyze(
+                show_progress=True, force_reanalyze=force_reanalyze
+            )
+            self.cell_names = metadata["valid_cells"]
+            print(f"✓ Loaded {len(self.cell_names):,} valid cells")
+        else:
+            # Load all cells without filtering
+            print("Loading all cells without quality filter")
+            with h5py.File(h5_file_path, "r") as f:
+                self.cell_names = list(f.keys())
+            print(f"✓ Loaded {len(self.cell_names):,} cells (no filtering)")
 
     def __len__(self) -> int:
         """Gibt die Anzahl der Zellen zurück."""
         return len(self.cell_names)
 
-    def __getitem__(self, idx: int) -> Dict[str, Any]:
+    def __getitem__(self, idx: int) -> Tuple[Any, Any]:
         """
         Lädt eine einzelne Zelle.
 
@@ -124,78 +473,48 @@ class H5CellDataset(Dataset):
             idx: Index der Zelle
 
         Returns:
-            Dictionary mit Zellendaten und/oder Features
+            Tuple (image, target) where transforms have been applied
         """
         if idx >= len(self.cell_names):
             raise IndexError(
-                f"Index {idx} außerhalb des Bereichs [0, {len(self.cell_names)})"
+                f"Index {idx} außerhalb des Bereichs [0, {len(self.cell_names)})]"
             )
 
         cell_name = self.cell_names[idx]
-        result = {"cell_name": cell_name}
 
-        # Lade Zellendaten
+        # Load raw cell data
         cell_data = self._load_cell_data(cell_name)
 
-        # Füge Rohdaten hinzu falls gewünscht
-        if self.return_raw:
-            result["raw_data"] = cell_data
+        # Apply transform to input images
+        result = {}
+        if self.transform:
+            result["images"] = self.transform(cell_data)
 
-        # Extrahiere Features falls gewünscht
-        if self.return_features and self.feature_extractor:
-            features = self.feature_extractor.extract_all_features(cell_data, cell_name)
-            features.update({"index_cell": idx})
-            result["features"] = features
+        # Apply target_transform to create target/label
+        if self.target_transform:
+            result["labels"] = self.target_transform(cell_data)
+
+        if self.feature_extractor:
+            result["features"] = self.feature_extractor(cell_data)
 
         return result
 
     def _load_cell_data(
         self, cell_name: str
     ) -> Dict[str, List[Tuple[str, np.ndarray]]]:
-        """Lädt Daten für eine einzelne Zelle."""
+        """Lädt RAW Daten für eine einzelne Zelle (ohne Verarbeitung)."""
         with h5py.File(self.h5_file_path, "r") as f:
             if cell_name not in f:
                 raise KeyError(f"Zelle {cell_name} nicht gefunden")
 
             grp = f[cell_name]
-            cell_data = {}
-
+            cell_data = {"cell_name": cell_name}
             for channel_name, channel_data in grp.items():
-                # Überspringe Kanäle falls Filter gesetzt
-                if self.channels and channel_name not in self.channels:
-                    continue
-
                 cell_data[channel_name] = []
-
+                cell_data["planes"] = channel_data.keys()  # list of planes
                 for plane_name, plane_data in channel_data.items():
                     image = plane_data[()]
-                    masks = {}
-                    
-                    # Load segmentation masks if they exist for this plane
-                    if "nuclei_seg" in grp:
-                        nuclei_seg_group = grp["nuclei_seg"]
-                        if plane_name in nuclei_seg_group:
-                            masks["nuclei_seg"] = nuclei_seg_group[plane_name][()]
-                        else:
-                            masks["nuclei_seg"] = None
-                    
-                    if "seg" in grp:
-                        seg_group = grp["seg"]
-                        if plane_name in seg_group:
-                            masks["seg"] = seg_group[plane_name][()]
-                        else:
-                            masks["seg"] = None
-                    
-                    image = plane_data[()]
-                    # Bildverarbeitung anwenden
-                    if self.preprocessor:
-                        processed_image = self.preprocessor.process_image(
-                            image, channel_name, masks
-                        )
-                    else:
-                        processed_image = image
-
-                    cell_data[channel_name].append((plane_name, processed_image))
+                    cell_data[channel_name].append(image)
 
             return cell_data
 
@@ -211,7 +530,7 @@ class H5CellDataset(Dataset):
         Returns:
             DataFrame mit Features
         """
-        if not self.return_features or not self.feature_extractor:
+        if not self.feature_extractor:
             raise ValueError("Feature-Extraktion nicht aktiviert")
 
         if indices is None:
@@ -226,342 +545,218 @@ class H5CellDataset(Dataset):
         return pd.DataFrame(features_list)
 
 
-class PyTorchH5DataLoader:
+class CellImageDataset(H5CellDataset):
+    def __getitem__(self, idx):
+        data = super().__getitem__(idx)
+        channel_images = data.get("images", None)
+        labels = data.get("labels", None)
+        labels = list(labels.values())
+        images = []
+        images.extend(channel_images.get("bf", []))
+        images.extend(channel_images.get("405", []))
+        images = np.stack(images, axis=2)
+
+        if images.shape != (250, 250, 6):
+            raise ValueError(f"Unexpected image shape: {images.shape}")
+        return images, labels
+
+
+class CellImageTransform:
     """
-    Wrapper für H5CellDataset der die PyTorch DataLoader Funktionalität bereitstellt.
+    Transform class for processing input cell images (bf and 405 channels only).
+
+    Applies preprocessing steps like:
+    - Gaussian filtering
+    - Illumination correction
+    - Normalization
+    - Plane selection
+
+    Note: This transform only processes INPUT channels (bf, 405) for the CNN.
+          Target channels (488, 561) are handled by CellTargetTransform.
+
+    Usage:
+        transform = CellImageTransform(
+            plane_selection='middle',
+            apply_gaussian=True
+        )
+        processed_images = transform(raw_cell_data)
     """
 
     def __init__(
         self,
-        h5_file_path: str,
-        preprocessor: Optional["ImagePreprocessor"] = None,
-        feature_extractor: Optional["FeatureExtractor"] = None,
-        return_features: bool = True,
-        return_raw: bool = False,
-        channels: Optional[List[str]] = None,
+        plane_selection: str = "all",
+        transforms: Optional[List[Any]] = None,
     ):
-
-        self.dataset = H5CellDataset(
-            h5_file_path=h5_file_path,
-            preprocessor=preprocessor,
-            feature_extractor=feature_extractor,
-            return_features=return_features,
-            return_raw=return_raw,
-            channels=channels,
-        )
-
-    def get_dataloader(
-        self,
-        batch_size: int = 32,
-        shuffle: bool = False,
-        num_workers: int = 0,
-        **kwargs,
-    ) -> "DataLoader":
         """
-        Erstellt einen PyTorch DataLoader.
+        Args:
+            plane_selection: Which planes to select ('middle', 'first', 'last', 'all')
+            apply_gaussian: Whether to apply Gaussian filtering
+            sigma: Sigma for Gaussian filter
+            apply_illumination_correction: Whether to correct illumination
+            normalize: Whether to normalize images
+        """
+        # Hardcoded input channels for CNN
+        self.channels = ["bf", "405"]
+        self.plane_selection = plane_selection
+        self.transforms = transforms if transforms is not None else []
+
+    def __call__(self, cell_data: Dict) -> np.ndarray:
+        """
+        Process cell data and return stacked image array.
 
         Args:
-            batch_size: Batch-Größe
-            shuffle: Ob Daten gemischt werden sollen
-            num_workers: Anzahl Worker-Prozesse
-            **kwargs: Weitere DataLoader-Parameter
+            cell_data: Dictionary with channel data from H5 file
 
         Returns:
-            PyTorch DataLoader
+            Stacked numpy array of shape (height, width, n_channels * n_planes)
         """
-        if not PYTORCH_AVAILABLE:
-            raise ImportError("PyTorch ist nicht installiert")
+        processed_images_channels = {channel: [] for channel in self.channels}
 
-        return DataLoader(
-            self.dataset,
-            batch_size=batch_size,
-            shuffle=shuffle,
-            num_workers=num_workers,
-            collate_fn=self._collate_fn,
-            **kwargs,
-        )
+        for channel in self.channels:
+            if channel not in cell_data:
+                continue
 
-    def _collate_fn(self, batch: List[Dict]) -> Dict[str, Any]:
-        """
-        Custom collate function für Batch-Verarbeitung.
+            # Get plane data (list of tuples: [(plane_name, image), ...])
+            images = cell_data[channel]
 
-        Args:
-            batch: Liste von Dataset-Items
+            # transform each image
+            for image in images:
+                for transform in self.transforms:
+                    image = transform(image)
+                processed_images_channels[channel].append(image)
 
-        Returns:
-            Batch-Dictionary
-        """
-        result = {}
-
-        # Sammle cell_names
-        result["cell_names"] = [item["cell_name"] for item in batch]
-
-        # Sammle Features falls vorhanden
-        if "features" in batch[0]:
-            features_list = [item["features"] for item in batch]
-            result["features"] = pd.DataFrame(features_list)
-
-        # Sammle Rohdaten falls vorhanden
-        if "raw_data" in batch[0]:
-            result["raw_data"] = [item["raw_data"] for item in batch]
-
-        return result
-
-    def __len__(self) -> int:
-        """Gibt die Anzahl der Zellen zurück."""
-        return len(self.dataset)
-
-    def get_features_dataframe(
-        self, indices: Optional[List[int]] = None
-    ) -> pd.DataFrame:
-        """Delegiert an Dataset."""
-        return self.dataset.get_features_dataframe(indices)
+        # Stack all processed images along channel dimension
+        return {
+            channel: images for channel, images in processed_images_channels.items()
+        }
 
 
-class PyTorchMLDataPipeline:
+class FUCCIRepresentationTransform:
     """
-    Erweiterte ML-Pipeline die PyTorch DataLoader nutzt.
-    Bietet optimierte Performance und Parallelisierung.
+    Transform class for computing FUCCI representation (TARGET channels: 488, 561).
+
+    Applies the same preprocessing as CellImageTransform (Gaussian, illumination correction,
+    normalization) to FUCCI channels and extracts intensity values as regression targets.
+
+    Usage:
+        target_transform = FUCCIRepresentationTransform(
+            plane_selection='middle',
+            apply_gaussian=True
+        )
+        fucci_target = target_transform(raw_cell_data)
     """
 
     def __init__(
         self,
-        h5_file_path: str,
-        preprocessor: Optional["ImagePreprocessor"] = None,
-        feature_extractor: Optional["FeatureExtractor"] = None,
-    ):
-        self.h5_file_path = h5_file_path
-        self.preprocessor = preprocessor or ImagePreprocessor()
-        self.feature_extractor = feature_extractor or FeatureExtractor()
-
-        self.pytorch_loader = PyTorchH5DataLoader(
-            h5_file_path=h5_file_path,
-            preprocessor=self.preprocessor,
-            feature_extractor=self.feature_extractor,
-            return_features=True,
-            return_raw=False,
-        )
-
-    def get_feature_dataloader(
-        self,
-        batch_size: int = 32,
-        shuffle: bool = False,
-        num_workers: int = 0,
-        **kwargs,
-    ) -> "DataLoader":
-        """
-        Erstellt einen PyTorch DataLoader für Features.
-
-        Args:
-            batch_size: Batch-Größe
-            shuffle: Ob Daten gemischt werden sollen
-            num_workers: Anzahl Worker-Prozesse für Parallelisierung
-            **kwargs: Weitere DataLoader-Parameter
-
-        Returns:
-            PyTorch DataLoader
-        """
-        return self.pytorch_loader.get_dataloader(
-            batch_size=batch_size, shuffle=shuffle, num_workers=num_workers, **kwargs
-        )
-
-    def get_raw_dataloader(
-        self,
-        batch_size: int = 32,
-        shuffle: bool = False,
-        num_workers: int = 0,
-        channels: Optional[List[str]] = None,
-        **kwargs,
-    ) -> "DataLoader":
-        """
-        Erstellt einen PyTorch DataLoader für Rohdaten.
-
-        Args:
-            batch_size: Batch-Größe
-            shuffle: Ob Daten gemischt werden sollen
-            num_workers: Anzahl Worker-Prozesse
-            channels: Spezifische Kanäle zu laden
-            **kwargs: Weitere DataLoader-Parameter
-
-        Returns:
-            PyTorch DataLoader für Rohdaten
-        """
-        raw_loader = PyTorchH5DataLoader(
-            h5_file_path=self.h5_file_path,
-            preprocessor=self.preprocessor,
-            feature_extractor=None,
-            return_features=False,
-            return_raw=True,
-            channels=channels,
-        )
-
-        return raw_loader.get_dataloader(
-            batch_size=batch_size, shuffle=shuffle, num_workers=num_workers, **kwargs
-        )
-
-    def extract_all_features(
-        self,
-        max_items: Optional[int] = None,
-        batch_size: int = 32,
-        num_workers: int = 0,
-    ) -> pd.DataFrame:
-        """
-        Extrahiert Features für alle Zellen mit PyTorch DataLoader.
-
-        Args:
-            max_items: Maximale Anzahl zu verarbeitender Items
-            batch_size: Batch-Größe
-            num_workers: Anzahl Worker-Prozesse
-
-        Returns:
-            DataFrame mit allen Features
-        """
-        if max_items:
-            indices = list(range(min(max_items, len(self.pytorch_loader))))
-        else:
-            indices = None
-
-        return self.pytorch_loader.get_features_dataframe(indices)
-
-    def create_training_pipeline(
-        self,
-        batch_size: int = 32,
-        shuffle: bool = True,
-        num_workers: int = 0,
-        validation_split: float = 0.2,
-        **kwargs,
-    ) -> Tuple["DataLoader", "DataLoader"]:
-        """
-        Erstellt Training- und Validierung-DataLoader.
-
-        Args:
-            batch_size: Batch-Größe
-            shuffle: Ob Training-Daten gemischt werden sollen
-            num_workers: Anzahl Worker-Prozesse
-            validation_split: Anteil für Validierung (0.0-1.0)
-            **kwargs: Weitere DataLoader-Parameter
-
-        Returns:
-            Tuple von (train_dataloader, val_dataloader)
-        """
-        if not PYTORCH_AVAILABLE:
-            raise ImportError("PyTorch ist nicht installiert")
-
-        from torch.utils.data import random_split
-
-        dataset = self.pytorch_loader.dataset
-        total_size = len(dataset)
-        val_size = int(total_size * validation_split)
-        train_size = total_size - val_size
-
-        train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
-
-        train_loader = DataLoader(
-            train_dataset,
-            batch_size=batch_size,
-            shuffle=shuffle,
-            num_workers=num_workers,
-            collate_fn=self.pytorch_loader._collate_fn,
-            **kwargs,
-        )
-
-        val_loader = DataLoader(
-            val_dataset,
-            batch_size=batch_size,
-            shuffle=False,  # Validierung nicht mischen
-            num_workers=num_workers,
-            collate_fn=self.pytorch_loader._collate_fn,
-            **kwargs,
-        )
-
-        return train_loader, val_loader
-
-
-# Legacy MLDataPipeline für Rückwärtskompatibilität
-
-
-class ImagePreprocessor:
-    """Klasse für Bildvorverarbeitung - getrennt von der Datenladung."""
-
-    def __init__(
-        self,
-        apply_gaussian: bool = True,
-        sigma: float = 1.0,
+        plane_selection: str = "all",
         apply_illumination_correction: bool = False,
+        repr_function: str = "mean",
     ):
-        self.apply_gaussian = apply_gaussian
-        self.sigma = sigma
+        """
+        Args:
+            plane_selection: Which planes to use ('middle', 'first', 'last', 'all')
+            apply_gaussian: Whether to apply Gaussian filtering
+            sigma: Sigma for Gaussian filter
+            apply_illumination_correction: Whether to correct illumination
+            normalize: Whether to normalize images
+            repr_function: How to aggregate intensities ('mean', 'median', 'sum')
+        """
+        # Hardcoded target channels for regression
+        self.channels = ["488", "561"]
+        self.plane_selection = plane_selection
         self.apply_illumination_correction = apply_illumination_correction
-        self.flatfields = {}
-        self.darkfields = {}
+        self.repr_function = repr_function
 
-    def normalize_image(self, image: np.ndarray) -> np.ndarray:
-        """Normalisiert ein Bild."""
-        img_mean = image.mean()
-        img_std = image.std()
-        if img_std > 0:
-            norm_image = (image - img_mean) / img_std
+    def __call__(self, cell_data: Dict) -> Dict:
+        """
+        Compute FUCCI representation from cell data with preprocessing.
+
+        Args:
+            cell_data: Dictionary with channel data from H5 file
+
+        Returns:
+            Numpy array of shape (n_channels,) with processed intensity values
+        """
+        intensities = {}
+        masks = cell_data.get("seg", None)
+
+        for channel in self.channels:
+            if channel not in cell_data:
+                raise KeyError(f"Channel {channel} not found in cell data")
+
+            if self.apply_illumination_correction:
+                images = self._remove_illumination(cell_data[channel], masks)
+            else:
+                images = cell_data[channel]
+
+            # Select planes
+            intensities[channel] = self._compute_intensity(
+                self._select_planes(images), self._select_planes(masks)
+            )
+
+        return intensities
+
+    def _select_planes(self, planes: List[np.ndarray]) -> List[np.ndarray]:
+        """Select planes based on selection strategy."""
+        if not planes:
+            raise ValueError("No planes available for selection")
+
+        if self.plane_selection == "middle":
+            mid_idx = len(planes) // 2
+            return [planes[mid_idx]]
+        elif self.plane_selection == "first":
+            return [planes[0]]
+        elif self.plane_selection == "last":
+            return [planes[-1]]
+        elif self.plane_selection == "all":
+            return planes
         else:
-            norm_image = image
-        return norm_image
+            raise ValueError(f"Unknown plane_selection: {self.plane_selection}")
 
-    def remove_illumination(self, image, mask):
-        """Entfernt Beleuchtungseffekte basierend auf einer Maske."""
-        if mask.sum() == 0:
-            return image  # Keine Maske, nichts zu tun
+    def _compute_intensity(
+        self, images: List[np.ndarray], masks: List[np.ndarray]
+    ) -> float:
+        """
+        Compute representative intensity across multiple planes with optional masking.
+        """
 
-        # Berechne den Mittelwert des Bildes aussesrhalb der Maske
-        mean_intensity = np.median(image[mask == 0])
-        std_intensity = np.std(image[mask == 0])
-        if std_intensity == 0:
-            std_intensity = 1  # Vermeide Division durch Null
+        if not masks:
+            raise ValueError("Segmentation mask is required for intensity computation")
+        all_masked_values = []
+        for image, mask in zip(images, masks):
+            if mask is not None and np.sum(mask > 0) > 0:
+                masked_values = image[mask > 0]
+                all_masked_values.extend(masked_values)
 
-        # Subtrahiere den Mittelwert von allen Pixeln
-        corrected_image = (image - mean_intensity) / std_intensity
+        if not all_masked_values:
+            raise ValueError("No valid masked pixels found across all planes")
 
-        # Setze negative Werte auf Null
-        corrected_image[corrected_image < 0] = 0
+        if self.repr_function == "mean":
+            return float(np.mean(all_masked_values))
+        elif self.repr_function == "median":
+            return float(np.median(all_masked_values))
+        elif self.repr_function == "sum":
+            return float(np.sum(all_masked_values))
+        else:
+            raise ValueError(f"Unknown repr_function: {self.repr_function}")
 
-        return corrected_image
-
-    def apply_gaussian_filter(self, image: np.ndarray) -> np.ndarray:
-        """Wendet Gauss-Filter an."""
-        if self.apply_gaussian:
-            return ndimage.gaussian_filter(image, sigma=self.sigma)
-        return image
-
-    def process_image(
-        self, image: np.ndarray, channel_name: str = None, masks: dict = None
+    def _remove_illumination(
+        self, images: List[np.ndarray], masks: List[np.ndarray]
     ) -> np.ndarray:
-        """Führt komplette Bildverarbeitung durch."""
-        # Ensure image is a proper numpy array
-        if not isinstance(image, np.ndarray):
-            return image
-            
-        if channel_name == "seg" or channel_name == "nuclei_seg":
-            return image  # Segmentierungsmasken nicht verarbeiten
+        """Remove illumination effects based on mask."""
+        corrected = []
+        for mask, image in zip(masks, images):
+            if mask is None or mask.sum() == 0:
+                raise ValueError(
+                    "Segmentation mask is required for illumination correction"
+                )
 
-        # Start with original image
-        processed_image = image
-        
-        # Beleuchtungskorrektur falls verfügbar und masks nicht None
-        if (
-            channel_name in ["405", "488", "561"]
-            and self.apply_illumination_correction
-            and masks is not None
-        ):
-            if channel_name == "405" and "nuclei_seg" in masks and masks["nuclei_seg"] is not None:
-                processed_image = self.remove_illumination(image, masks["nuclei_seg"])
-            elif channel_name in ["488", "561"] and "seg" in masks and masks["seg"] is not None:
-                processed_image = self.remove_illumination(image, masks["seg"])
-        
-        # Gauss-Filter und Normalisierung
-        if channel_name in ["bf"]:
-            processed_image = self.apply_gaussian_filter(processed_image)
+            mean_intensity = np.median(image[mask == 0])
+            corrected = image - mean_intensity
+            corrected[corrected < 0] = 0
+            corrected.append(corrected)
 
-        return processed_image
-
-
+        return corrected
 
 
 class FeatureExtractor:
@@ -653,11 +848,11 @@ class FeatureExtractor:
             # Nimm mittlere Ebene jedes Kanals
             middle_idx = len(cell_data["405"]) // 2
 
-            nucleus_image = cell_data["405"][middle_idx][1]
-            seg_mask = cell_data["seg"][middle_idx][1]
-            red_image = cell_data["561"][middle_idx][1]
-            green_image = cell_data["488"][middle_idx][1]
-            nuclei_seg_mask = cell_data["nuclei_seg"][middle_idx][1]
+            nucleus_image = cell_data["405"][middle_idx]
+            seg_mask = cell_data["seg"][middle_idx]
+            red_image = cell_data["561"][middle_idx]
+            green_image = cell_data["488"][middle_idx]
+            nuclei_seg_mask = cell_data["nuclei_seg"][middle_idx]
             # Morphologische Features
             morphological_features_cell = self.extract_morphological_features(
                 nucleus_image, seg_mask, cell_name, type="cell"
@@ -689,7 +884,8 @@ class FeatureExtractor:
             features.update(green_stats)
 
         except Exception as e:
-            print(f"Fehler beim Extrahieren der Features für {cell_name}: {e}")
+            print(f"Fehler beim Extrahieren der Features für {cell_name}:")
+            traceback.print_exc()
 
         return features
 
@@ -707,405 +903,93 @@ class FeatureExtractor:
         }
 
 
-class H5DataLoader(BaseDataLoader):
-    """Spezialisierter DataLoader für H5-Dateien mit Generator-Support."""
-
+class CellDataModule(L.LightningDataModule):
     def __init__(
-        self, file_path: str, preprocessor: Optional[ImagePreprocessor] = None
+        self,
+        batch_size: int = 32,
+        num_workers: int = 0,
+        data_config_path: str = "configs/data_config.yaml",
     ):
-        self.file_path = file_path
-        self.preprocessor = preprocessor or ImagePreprocessor()
-        self.cell_names = []
-        self._item_count = 0
 
-        if not os.path.exists(file_path):
-            raise FileNotFoundError(f"H5-Datei nicht gefunden: {file_path}")
+        super().__init__()
+        with open(data_config_path, "r") as f:
+            config = yaml.safe_load(f)
+        self.save_hyperparameters()
+        self.dataset_config = config.get("data_set_config", {})
+        self.transforms_config = config.get("transforms_config", {})
+        self.transforms_target = config.get("transforms_target", {})
+        self.batch_size = batch_size
+        self.num_workers = num_workers
+        self.train_validation_split = config.get("train_val_split", 0.8)
+        self.train_dataset = None
+        self.val_dataset = None
+        self.test_dataset = None
 
-        # Initialisiere und sammle Zellnamen
-        self._initialize()
-
-    def _initialize(self):
-        """Initialisiert den DataLoader und sammelt Metadaten."""
-        with h5py.File(self.file_path, "r") as f:
-            self.cell_names = list(f.keys())
-            self._item_count = len(self.cell_names)
-
-        print(f"H5DataLoader initialisiert: {self._item_count} Zellen gefunden")
-
-    def get_item_count(self) -> int:
-        """Gibt die Anzahl der verfügbaren Items zurück."""
-        return self._item_count
-
-    def load_single_cell(self, cell_name: str) -> Dict:
-        """Lädt eine einzelne Zelle aus der H5-Datei."""
-        with h5py.File(self.file_path, "r") as f:
-            if cell_name not in f:
-                raise KeyError(f"Zelle {cell_name} nicht in H5-Datei gefunden")
-
-            grp = f[cell_name]
-            cell_data = {}
-
-            for channel_name, channel_data in grp.items():
-                cell_data[channel_name] = []
-                for plane_name, plane_data in channel_data.items():
-                    masks = {}
-                    if "nuclei_seg" in grp:
-                        masks["nuclei_seg"] = grp.get("nuclei_seg", None)[plane_name][
-                            ()
-                        ]
-                    if "seg" in grp:
-                        masks["seg"] = grp.get("seg", None)[plane_name][()]
-                    image = plane_data[()]
-
-                    # Bildverarbeitung anwenden
-                    processed_image = self.preprocessor.process_image(
-                        image, channel_name, masks
-                    )
-                    cell_data[channel_name].append((plane_name, processed_image))
-
-            return cell_data
-
-    def load_batch(
-        self, batch_size: int = 32, start_idx: int = 0
-    ) -> Generator[List[Tuple[str, Dict]], None, None]:
-        """
-        Generator für batch-weise Datenladung.
-
-        Args:
-            batch_size: Größe der Batches
-            start_idx: Startindex
-
-        Yields:
-            List von (cell_name, cell_data) Tupeln
-        """
-        current_idx = start_idx
-
-        while current_idx < self._item_count:
-            batch_end = min(current_idx + batch_size, self._item_count)
-            batch_cell_names = self.cell_names[current_idx:batch_end]
-
-            batch_data = []
-            for cell_name in batch_cell_names:
-                try:
-                    cell_data = self.load_single_cell(cell_name)
-                    batch_data.append((cell_name, cell_data))
-                except Exception as e:
-                    print(f"Fehler beim Laden von Zelle {cell_name}: {e}")
-                    continue
-
-            if batch_data:
-                yield batch_data
-
-            current_idx = batch_end
-
-    def load_single_items(
-        self, start_idx: int = 0
-    ) -> Generator[Tuple[str, Dict], None, None]:
-        """
-        Generator für einzelne Zellen.
-
-        Args:
-            start_idx: Startindex
-
-        Yields:
-            (cell_name, cell_data) Tupel
-        """
-        for i in range(start_idx, self._item_count):
-            cell_name = self.cell_names[i]
-            try:
-                cell_data = self.load_single_cell(cell_name)
-                yield cell_name, cell_data
-            except Exception as e:
-                print(f"Fehler beim Laden von Zelle {cell_name}: {e}")
-                continue
-
-    def compute_illumination_correction_from_sample(self, sample_size: int = 100):
-        """Berechnet Beleuchtungskorrektur aus einer Stichprobe."""
-        if not self.preprocessor.apply_illumination_correction:
-            return
-
-        print(f"Sammle {sample_size} Bilder für Beleuchtungskorrektur...")
-        channel_images = {}
-
-        sample_count = 0
-        for cell_name, cell_data in self.load_single_items():
-            if sample_count >= sample_size:
-                break
-
-            for channel_name, planes in cell_data.items():
-                if channel_name == "seg":
-                    continue
-
-                if channel_name not in channel_images:
-                    channel_images[channel_name] = []
-
-                # Nimm mittlere Ebene
-                middle_idx = len(planes) // 2
-                if middle_idx < len(planes):
-                    _, image = planes[middle_idx]
-                    channel_images[channel_name].append(image)
-
-            sample_count += 1
-
-        # Berechne Korrektur
-        self.preprocessor.compute_illumination_correction(channel_images)
-
-    def get_channel_names(self) -> List[str]:
-        """Gibt die verfügbaren Kanalnamen zurück."""
-        if not self.cell_names:
-            return []
-
-        # Verwende erste Zelle als Referenz
-        first_cell_name = self.cell_names[0]
-        cell_data = self.load_single_cell(first_cell_name)
-        return list(cell_data.keys())
-
-
-class MLDataPipeline:
-    """Hauptklasse die DataLoader, Preprocessor und FeatureExtractor kombiniert."""
-
-    def __init__(
-        self, data_loader: BaseDataLoader, feature_extractor: FeatureExtractor
-    ):
-        self.data_loader = data_loader
-        self.feature_extractor = feature_extractor
-
-    def extract_features_batch(
-        self, batch_size: int = 32, max_items: Optional[int] = None
-    ) -> pd.DataFrame:
-        """
-        Extrahiert Features in Batches für memory-effiziente Verarbeitung.
-
-        Args:
-            batch_size: Größe der Batches
-            max_items: Maximale Anzahl zu verarbeitender Items
-
-        Returns:
-            DataFrame mit extrahierten Features
-        """
-        all_features = []
-        processed_count = 0
-
-        total_items = min(max_items or float("inf"), self.data_loader.get_item_count())
-
-        print(f"Extrahiere Features für {total_items} Items...")
-
-        with tqdm(total=total_items) as pbar:
-            for batch in self.data_loader.load_batch(batch_size):
-                batch_features = []
-
-                for cell_name, cell_data in batch:
-                    if max_items and processed_count >= max_items:
-                        break
-
-                    features = self.feature_extractor.extract_all_features(
-                        cell_data, cell_name
-                    )
-                    batch_features.append(features)
-                    processed_count += 1
-                    pbar.update(1)
-
-                all_features.extend(batch_features)
-
-                if max_items and processed_count >= max_items:
-                    break
-
-        return pd.DataFrame(all_features)
-
-    def create_training_generator(
-        self, batch_size: int = 32, extract_features: bool = True
-    ) -> Generator:
-        """
-        Erstellt einen Generator für Training-Pipelines.
-
-        Args:
-            batch_size: Größe der Batches
-            extract_features: Ob Features extrahiert werden sollen
-
-        Yields:
-            Batch von Daten (entweder Rohdaten oder Features)
-        """
-        for batch in self.data_loader.load_batch(batch_size):
-            if extract_features:
-                # Extrahiere Features für den Batch
-                batch_features = []
-                for cell_name, cell_data in batch:
-                    features = self.feature_extractor.extract_all_features(
-                        cell_data, cell_name
-                    )
-                    batch_features.append(features)
-
-                yield pd.DataFrame(batch_features)
-            else:
-                # Gib Rohdaten zurück
-                yield batch
-
-
-class DataProcessor:
-    """Klasse für Standard Iris Datenverarbeitung und -vorbereitung."""
-
-    def __init__(self):
-        self.scaler = StandardScaler()
-        self.target_names = ["setosa", "versicolor", "virginica"]
-
-    def load_data(self):
-        """Lädt den Standard Iris-Datensatz."""
-        iris = load_iris()
-
-        # Erstelle DataFrame
-        df = pd.DataFrame(
-            iris.data,
-            columns=["sepal_length", "sepal_width", "petal_length", "petal_width"],
+    def setup(self, stage: Optional[str] = None):
+        """Teilt das Dataset in Trainings-, Validierungs- und Testdaten auf."""
+        transform_config_list = self.transforms_config.pop("transforms", [])
+        transform_list = [
+            partial(resolve(cfg["class_path"]), **cfg["init_args"])
+            for cfg in transform_config_list
+        ]
+        self.image_transform = CellImageTransform(
+            **self.transforms_config, transforms=transform_list
         )
-        df["species"] = iris.target
-        df["species_name"] = df["species"].map(
-            {i: name for i, name in enumerate(self.target_names)}
+        self.target_transform = FUCCIRepresentationTransform(**self.transforms_target)
+
+        self.dataset = CellImageDataset(
+            **self.dataset_config,
+            transform=self.image_transform,
+            target_transform=self.target_transform,
+        )
+        self.train_dataset, self.val_dataset, self.test_dataset = random_split(
+            self.dataset,
+            [
+                self.train_validation_split,
+                (1 - self.train_validation_split) / 2,
+                (1 - self.train_validation_split) / 2,
+            ],
         )
 
-        return df, iris.data, iris.target
-
-    def prepare_data(self, X, y, test_size=0.2, random_state=42):
-        """Teilt Daten in Training und Test auf."""
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=test_size, random_state=random_state, stratify=y
+    def train_dataloader(self):
+        """Gibt den DataLoader für das Training zurück."""
+        return DataLoader(
+            self.train_dataset, batch_size=self.batch_size, num_workers=self.num_workers
         )
 
-        # Standardisierung
-        X_train_scaled = self.scaler.fit_transform(X_train)
-        X_test_scaled = self.scaler.transform(X_test)
+    def val_dataloader(self):
+        """Gibt den DataLoader für die Validierung zurück."""
+        return DataLoader(
+            self.val_dataset, batch_size=self.batch_size, num_workers=self.num_workers
+        )
 
-        return X_train_scaled, X_test_scaled, y_train, y_test
-
-    def save_scaler(self, filepath="models/scaler.pkl"):
-        """Speichert den Scaler für spätere Verwendung."""
-        os.makedirs(os.path.dirname(filepath), exist_ok=True)
-        joblib.dump(self.scaler, filepath)
-
-    def load_scaler(self, filepath="models/scaler.pkl"):
-        """Lädt einen gespeicherten Scaler."""
-        self.scaler = joblib.load(filepath)
-        return self.scaler
+    def test_dataloader(self):
+        """Gibt den DataLoader für den Test zurück."""
+        return DataLoader(
+            self.test_dataset, batch_size=self.batch_size, num_workers=self.num_workers
+        )
 
 
 if __name__ == "__main__":
-    print("IRIS ML PIPELINE - PYTORCH DATALOADER INTEGRATION")
-    print("=" * 70)
+    from scipy.ndimage import gaussian_filter
 
-    # 1. Standard Iris Dataset Demo
-    print("\n1. STANDARD IRIS DATASET:")
-    processor = DataProcessor()
-    df, X, y = processor.load_data()
+    # Beispielhafte Nutzung
+    h5_path = (
+        "/myhome/iris/data/fucci_3t3_221124_filtered_noNG030JP208_with_nuclei_seg.h5"
+    )
+    preprocessor = CellImageTransform(
+        transforms=[lambda x: gaussian_filter(x, sigma=1.0)]
+    )
+    feature_extractor = FeatureExtractor()
 
-    print(f"Shape: {df.shape}")
-    print(f"Klassen: {processor.target_names}")
-    print("\nErste 5 Zeilen:")
-    print(df.head())
-
-    # Daten vorbereiten
-    X_train, X_test, y_train, y_test = processor.prepare_data(X, y)
-    print(f"\nTraining Set: {X_train.shape}")
-    print(f"Test Set: {X_test.shape}")
-
-    # Scaler speichern
-    processor.save_scaler()
-    print("Scaler gespeichert.")
-
-    # 2. PyTorch H5 Pipeline Demo
-    print("\n2. PYTORCH H5 DATENPIPELINE:")
-    example_h5_path = "/mydata/iris/andreas/fucci_3t3_221124_filtered_noNG030JP208.h5"
-
-    if os.path.exists(example_h5_path):
-        print(f"Teste PyTorch Pipeline mit: {example_h5_path}")
-        try:
-            if PYTORCH_AVAILABLE:
-                # Erstelle PyTorch Pipeline
-                preprocessor = ImagePreprocessor(
-                    apply_gaussian=True, sigma=1.0, apply_illumination_correction=False
-                )
-
-                feature_extractor = FeatureExtractor()
-                pytorch_pipeline = PyTorchMLDataPipeline(
-                    example_h5_path, preprocessor, feature_extractor
-                )
-
-                print(f"✓ PyTorch Pipeline initialisiert")
-                print(f"✓ Dataset Größe: {len(pytorch_pipeline.pytorch_loader)}")
-
-                # Teste PyTorch DataLoader
-                print("\n3. TESTE PYTORCH DATALOADER:")
-                feature_dataloader = pytorch_pipeline.get_feature_dataloader(
-                    batch_size=8, shuffle=False, num_workers=0  # Für Demo
-                )
-
-                print(f"✓ DataLoader erstellt (batch_size=8)")
-
-                # Teste ersten Batch
-                first_batch = next(iter(feature_dataloader))
-                print(f"✓ Erster Batch geladen:")
-                print(f"  Cell Names: {len(first_batch['cell_names'])}")
-                print(f"  Features Shape: {first_batch['features'].shape}")
-                print(
-                    f"  Feature Columns: {list(first_batch['features'].columns)[:5]}..."
-                )
-
-                # Teste Training/Validation Split
-                print("\n4. TESTE TRAINING/VALIDATION SPLIT:")
-                train_loader, val_loader = pytorch_pipeline.create_training_pipeline(
-                    batch_size=4, validation_split=0.2, num_workers=0
-                )
-
-                print(f"✓ Training DataLoader: ~{len(train_loader)} Batches")
-                print(f"✓ Validation DataLoader: ~{len(val_loader)} Batches")
-
-            else:
-                print("❌ PyTorch nicht verfügbar - verwende Legacy DataLoader")
-
-                # Fallback auf Legacy-Implementation
-                preprocessor = ImagePreprocessor(apply_gaussian=True)
-                loader = H5DataLoader(example_h5_path, preprocessor)
-                extractor = FeatureExtractor()
-                legacy_pipeline = MLDataPipeline(loader, extractor)
-
-                print(
-                    f"✓ Legacy Pipeline initialisiert mit {loader.get_item_count()} Zellen"
-                )
-
-                features_df = legacy_pipeline.extract_features_batch(
-                    batch_size=10, max_items=20
-                )
-                print(f"✓ Features extrahiert: {features_df.shape}")
-
-        except Exception as e:
-            print(f"Fehler bei der Pipeline: {e}")
-            import traceback
-
-            traceback.print_exc()
-    else:
-        print(f"H5-Datei nicht gefunden: {example_h5_path}")
-        print("PyTorch Integration erfolgreich implementiert!")
-        print("\n✓ Verfügbare Klassen:")
-        print("  - H5CellDataset (PyTorch Dataset)")
-        print("  - PyTorchH5DataLoader (PyTorch DataLoader Wrapper)")
-        print("  - PyTorchMLDataPipeline (Hauptpipeline mit PyTorch)")
-        print("  - Legacy Klassen für Rückwärtskompatibilität")
-
-        print("\n📖 PyTorch Beispiel-Verwendung:")
-        print("pipeline = PyTorchMLDataPipeline('data.h5')")
-        print(
-            "dataloader = pipeline.get_feature_dataloader(batch_size=32, num_workers=4)"
-        )
-        print("for batch in dataloader:")
-        print("    features_df = batch['features']  # Ready for ML training")
-
-        if PYTORCH_AVAILABLE:
-            print(f"\n✅ PyTorch verfügbar: Version installiert")
-        else:
-            print(f"\n⚠️  PyTorch nicht verfügbar. Installieren Sie mit:")
-            print("    pip install torch")
-
-    print("\n" + "=" * 70)
-    print("✓ DEMO ABGESCHLOSSEN")
-    print("✓ PyTorch DataLoader Integration implementiert")
-    print("✓ Optimierte Performance durch Parallelisierung")
-    print("✓ Nahtlose Integration in ML-Pipelines")
-    print("✓ Rückwärtskompatibilität gewährleistet")
+    dataset = CellImageDataset(
+        h5_file_path=h5_path,
+        transform=preprocessor,
+        target_transform=FUCCIRepresentationTransform(
+            plane_selection="all", repr_function="mean"
+        ),
+    )
+    print(f"Dataset Größe: {len(dataset)} Zellen")
+    print("Beispiel Zelle laden...")
+    example_cell = dataset[0]
+    print(f"✓ Geladene Beispielzelle: {example_cell}")
