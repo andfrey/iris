@@ -1,0 +1,58 @@
+# Configuration for Lightning CLI with Modular Architecture
+# Usage: python src/train_model.py fit --config configs/train_cnet_modular.yaml
+
+# Seed for reproducibility
+seed_everything: 42
+
+# Trainer configuration
+trainer:
+  default_root_dir: checkpoints/cnet/
+  max_epochs: 150
+  accelerator: auto
+  devices: 1
+  precision: 16-mixed
+  gradient_clip_val: 1.0
+  log_every_n_steps: 10
+  enable_checkpointing: true
+  profiler: simple
+  logger:
+    class_path: lightning.pytorch.loggers.TensorBoardLogger
+    init_args:
+      save_dir: logs
+      name: cnet_modular_training
+      default_hp_metric: false
+  callbacks:
+    - class_path: lightning.pytorch.callbacks.ModelSummary
+      init_args:
+        max_depth: -1  # Show all layers (default is 1)
+    - class_path: lightning.pytorch.callbacks.ModelCheckpoint
+      init_args:
+        monitor: val_loss
+        mode: min
+        save_top_k: 3
+        filename: 'epoch{epoch:02d}-val_loss{val_loss:.4f}'
+        auto_insert_metric_name: false
+    - class_path: lightning.pytorch.callbacks.EarlyStopping
+      init_args:
+        monitor: val_loss
+        patience: 20
+        mode: min
+    - class_path: lightning.pytorch.callbacks.LearningRateMonitor
+      init_args:
+        logging_interval: step
+
+# Model configuration
+model:
+  class_path: models.cnet.CNet
+  init_args:
+    in_channels: 6  # 2 channels × 3 planes = 6 total channels after stacking
+    output_dim: 2
+    dropout: 0.3
+    use_batchnorm: true
+    learning_rate: 0.0001
+    optimizer: adamw
+    weight_decay: 0.0005
+    scheduler: cosine
+
+data:
+  data_config_path: "configs/data_config.yaml"

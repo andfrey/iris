@@ -1,0 +1,31 @@
+# Data source
+  h5_path: data/fucci_3t3_221124_filtered_noNG030JP208_with_nuclei_seg.h5
+  
+  # DataLoader settings
+  batch_size: 64
+  num_workers: 0  # Use 0 for A100 to avoid shared memory issues
+  
+  # Train/val split
+  train_val_split: [0.8, 0.2]
+  seed: 42
+  
+  # Quality filters
+  use_quality_filters: true
+  plane_count: 3
+  max_objects: 1
+  min_seg_pixels: 10
+  max_nuclei_ratio: 1.2
+  force_refilter: false  # Use cached results if available
+  
+  # Preprocessing transforms
+  transforms:
+    # 1. Normalize BEFORE stacking (while channels still have their names)
+    - class_path: src.data_pipeline.data_transforms.NormalizeTransform
+      init_args:
+        method: standardize  # Changed to standardize for zero mean and unit variance
+        channel_keys: ['405', 'bf']
+    
+    # 2. Stack channels into single array (2 channels × 3 planes = 6 total)
+    - class_path: src.data_pipeline.data_transforms.StackChannelsTransform
+      init_args:
+        channel_order: ['bf', '405']  # Order: bf planes first, then 405 planes
