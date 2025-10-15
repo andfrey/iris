@@ -1,8 +1,7 @@
 import argparse
 import h5py
 import numpy as np
-import matplotlib.pyplot as plt
-from cellpose import models, io
+from cellpose import models
 import os
 import logging
 from tqdm import tqdm
@@ -17,47 +16,50 @@ def segment_nuclei_cellpose_direct(
     h5_path,
     output_h5_path=None,
     gpu=False,
-    visualize=False,
     model_type="nuclei",
     diameter=None,
     max_cells=None,
     plane_selection="middle",
     overwrite=False,
-    cells_per_batch=10,
+    cells_per_batch=2,
+    log_file=None,
 ):
     """
-    Segmentiert Nukleai direkt aus H5-Datei und fügt nuclei_seg Kanal hinzu.
-    Verarbeitet Zellen in Batches (sammelt mehrere Zellen, dann segmentiert alle Planes).
+    Segments nuclei directly from H5 file and adds nuclei_seg channel.
+    Processes cells in batches (default: 2 cells), batching all planes together.
 
-    WICHTIG: Cellpose v4 verarbeitet 2D-Bilder in Listen IMMER sequentiell.
-    Der batch_size-Parameter (Standard:64) kontrolliert GPU-Parallelisierung INNERHALB
-    jedes Bildes durch Verarbeitung mehrerer 256x256-Patches gleichzeitig.
-
-    cells_per_batch sollte hoch sein (10-20) um Overhead zu reduzieren.
-
-    Parameter:
-    - h5_path: Pfad zur Input H5-Datei
-    - output_h5_path: Pfad zur Output H5-Datei (None = bearbeitet Input-Datei direkt)
-    - gpu: GPU verwenden
-    - visualize: Ergebnisse visualisieren
-    - model_type: Cellpose-Modelltyp ('nuclei', 'cyto', 'cyto2')
-    - diameter: Nukleaidurchmesser (None = automatisch)
-    - max_cells: Maximale Anzahl zu verarbeitender Zellen
-    - plane_selection: Welche Planes verarbeiten ('middle', 'first', 'last', 'all')
-    - overwrite: Bestehende nuclei_seg überschreiben
-    - cells_per_batch: Anzahl Zellen pro Batch (Standard: 10, höher = effizienter)
+    Parameters:
+    - h5_path: Path to input H5 file
+    - output_h5_path: Path to output H5 file (None = edits input file directly)
+    - gpu: Use GPU
+    - visualize: Visualize segmentation results
+    - model_type: Cellpose model type ('nuclei', 'cyto', 'cyto2')
+    - diameter: Nucleus diameter (None = automatic)
+    - max_cells: Maximum number of cells to process
+    - plane_selection: Which planes to process ('middle', 'first', 'last', 'all')
+    - overwrite: Overwrite existing nuclei_seg
+    - cells_per_batch: Number of cells per batch (default: 2)
+    - log_file: Path to log file for tqdm output (None = stderr)
     """
 
-    # Bestimme Output-Pfad - IMMER neue Datei in /myhome/iris erstellen
-    if output_h5_path is None:
-        # Erstelle Output in /myhome/iris (wo Speicherplatz verfügbar ist)
-        input_basename = os.path.splitext(os.path.basename(h5_path))[0]
-        output_h5_path = f"/myhome/iris/data/{input_basename}_with_nuclei_seg.h5"
-        logger.info(f"Erstelle neue Datei mit nuclei_seg in: {output_h5_path}")
+    global _output_file_path
 
-    mode = "w"  # Immer neue Datei erstellen
+    _output_file_path = output_h5_path
+    mode = "w"  # Always create new file
 
-    # Überprüfe verfügbaren Speicherplatz
+    # Setup tqdm file output
+    tqdm_file = None
+    if log_file:
+        try:
+            tqdm_file = open(log_file, "a")
+            logger.info(f"tqdm progress will be logged to: {log_file}")
+        except Exception as e:
+            logger.warning(f"Could not open tqdm log file: {e}")
+            tqdm_file = sys.stderr
+    else:
+        tqdm_file = sys.stderr
+
+    # Check available disk space
     import shutil
 
     output_dir = os.path.dirname(output_h5_path)
@@ -66,16 +68,22 @@ def segment_nuclei_cellpose_direct(
 
     if free_gb < 1.0:
         raise RuntimeError(
-            f"Nicht genügend Speicherplatz in {output_dir}. Verfügbar: {free_gb:.2f} GB"
+            f"Not enough disk space in {output_dir}. Available: {free_gb:.2f} GB"
         )
 
-    logger.info(f"Verfügbarer Speicherplatz in {output_dir}: {free_gb:.2f} GB")
+    logger.info(f"Available disk space in {output_dir}: {free_gb:.2f} GB")
 
-    # Cellpose Modell laden
-    logger.info(f"Lade Cellpose-Modell: {model_type}, GPU: {gpu}")
-    model = models.CellposeModel(gpu=gpu, model_type=model_type)
+    # Load Cellpose model with timeout handling
+    logger.info(f"Loading Cellpose model: {model_type}, GPU: {gpu}")
+    try:
+        model = models.CellposeModel(gpu=gpu, model_type=model_type)
+        logger.info("Model loaded successfully")
+    except Exception as e:
+        logger.error(f"Error loading Cellpose model: {e}")
+        logger.error("Tip: For network issues, download model manually beforehand")
+        raise
 
-    # Metadaten für Segmentierung
+    # Metadata for segmentation
     segmentation_metadata = {
         "cellpose_model": model_type,
         "diameter": diameter if diameter else "auto",
@@ -84,16 +92,16 @@ def segment_nuclei_cellpose_direct(
         "source_file": os.path.basename(h5_path),
     }
 
-    # Öffne neue H5-Datei und kopiere + erweitere Daten
+    # Open new H5 file and copy + extend data
     # Using context managers ensures files are properly closed even on exceptions
     try:
         with h5py.File(output_h5_path, mode) as output_file:
 
-            # Kopiere alle Originaldaten aus Input-Datei
-            logger.info("Kopiere ursprüngliche Datenstruktur...")
+            # Copy all original data from input file
+            logger.info("Copying original data structure...")
             with h5py.File(h5_path, "r") as input_file:
 
-                # Füge Metadaten zur Output-Datei hinzu
+                # Add metadata to output file
                 output_file.attrs["source_file"] = os.path.basename(h5_path)
                 output_file.attrs["creation_date"] = datetime.now().isoformat()
                 output_file.attrs["purpose"] = "complete_with_nuclei_segmentation"
@@ -104,62 +112,63 @@ def segment_nuclei_cellpose_direct(
                 )
 
                 logger.info(
-                    f"Verarbeite {total_cells} Zellen aus {len(cell_names)} verfügbaren"
+                    f"Processing {total_cells} cells from {len(cell_names)} available"
                 )
 
-                # Verarbeite jede Zelle - sammle zuerst alle Daten für Batch-Processing
+                # Process each cell - first collect all data for batch processing
                 processed_count = 0
                 failed_count = 0
-                total_nuclei = 0
 
-                # Verarbeite Zellen in Batches (z.B. 2 Zellen gleichzeitig)
-                cell_batch_data = []  # Sammelt Daten für mehrere Zellen
+                # Process cells in batches (e.g. 2 cells simultaneously)
+                cell_batch_data = []  # Collects data for multiple cells
 
                 for cell_idx, cell_name in enumerate(
                     tqdm(
                         cell_names[:total_cells],
-                        desc="Kopiere & Segmentiere Zellen",
+                        desc="Copy & Segment Cells",
+                        file=tqdm_file,
+                        mininterval=1.0,
                     )
                 ):
                     try:
-                        # Kopiere ursprüngliche Zell-Daten
+                        # Copy original cell data
                         input_file.copy(cell_name, output_file)
                         cell_group = output_file[cell_name]
 
                         if "405" not in cell_group:
-                            logger.warning(f"Kein 405-Kanal in Zelle {cell_name}")
+                            logger.warning(f"No 405 channel in cell {cell_name}")
                             failed_count += 1
                             continue
 
-                        # Prüfe ob nuclei_seg bereits existiert
+                        # Check if nuclei_seg already exists
                         if "nuclei_seg" in cell_group and not overwrite:
                             logger.info(
-                                f"nuclei_seg bereits vorhanden für {cell_name}, überspringe"
+                                f"nuclei_seg already present for {cell_name}, skipping"
                             )
                             processed_count += 1
                             continue
 
-                        # Erstelle/überschreibe nuclei_seg Gruppe
+                        # Create/overwrite nuclei_seg group
                         if "nuclei_seg" in cell_group:
                             del cell_group["nuclei_seg"]
                         nuclei_seg_group = cell_group.create_group("nuclei_seg")
 
-                        # Füge Metadaten hinzu
+                        # Add metadata
                         for key, value in segmentation_metadata.items():
                             nuclei_seg_group.attrs[key] = value
 
-                        # Lade 405-Kanal Daten
+                        # Load 405 channel data
                         channel_405 = cell_group["405"]
                         plane_names = list(channel_405.keys())
 
                         if not plane_names:
                             logger.warning(
-                                f"Keine Planes in 405-Kanal für Zelle {cell_name}"
+                                f"No planes in 405 channel for cell {cell_name}"
                             )
                             failed_count += 1
                             continue
 
-                        # Bestimme zu verarbeitende Planes
+                        # Determine planes to process
                         if plane_selection == "middle":
                             selected_planes = [plane_names[len(plane_names) // 2]]
                         elif plane_selection == "first":
@@ -173,7 +182,7 @@ def segment_nuclei_cellpose_direct(
                                 plane_names[len(plane_names) // 2]
                             ]  # Default
 
-                        # Sammle Daten dieser Zelle für Batch
+                        # Collect data for this cell for batch
                         cell_data = {
                             "cell_name": cell_name,
                             "cell_idx": cell_idx,
@@ -188,12 +197,12 @@ def segment_nuclei_cellpose_direct(
 
                         cell_batch_data.append(cell_data)
 
-                        # Verarbeite Batch wenn genug Zellen gesammelt oder am Ende
+                        # Process batch when enough cells collected or at end
                         if (
                             len(cell_batch_data) >= cells_per_batch
                             or cell_idx == total_cells - 1
                         ):
-                            # Sammle alle Bilder aus allen Zellen im Batch (flatten the list)
+                            # Collect all images from all cells in batch (flatten the list)
                             batch_images = []
                             for cell_data in cell_batch_data:
                                 batch_images.extend(cell_data["images"])
@@ -202,8 +211,8 @@ def segment_nuclei_cellpose_direct(
 
                             # Debug: Check batch_images structure
                             logger.info(
-                                f"Segmentiere Batch {batch_num}: {len(cell_batch_data)} Zellen, "
-                                f"{len(batch_images)} Planes gesamt"
+                                f"Segmenting batch {batch_num}: {len(cell_batch_data)} cells, "
+                                f"{len(batch_images)} planes total"
                             )
                             logger.debug(
                                 f"batch_images type: {type(batch_images)}, "
@@ -211,29 +220,22 @@ def segment_nuclei_cellpose_direct(
                                 f"first element shape: {batch_images[0].shape if batch_images and hasattr(batch_images[0], 'shape') else 'N/A'}"
                             )
 
-                            # Batch-Segmentierung aller Planes
-                            # IMPORTANT: Cellpose v4 design for 2D images:
-                            # - Pass as LIST: processes sequentially, but GPU-parallelizes within each image
-                            # - batch_size: number of 256x256 patches processed in parallel per image
-                            # - Passing (N,H,W) array: treats N as Z-dimension for 3D, NOT multiple 2D images!
-                            #
-                            # Performance optimization: Increase batch_size for better GPU utilization
                             start_time = time.time()
 
                             logger.info(
-                                f"Segmentiere {len(batch_images)} Planes "
-                                f"(sequential mit GPU-parallelisierung, batch_size=64 patches)"
+                                f"Segmenting {len(batch_images)} planes "
+                                f"(sequential with GPU parallelization, batch_size=64 patches)"
                             )
 
                             masks_batch, flows_batch, styles_batch = model.eval(
-                                batch_images,  # Keep as list for 2D processing
+                                batch_images,
                                 diameter=diameter,
-                                batch_size=64,  # Higher = more 256x256 patches in parallel per image
+                                batch_size=64,
                             )
 
                             elapsed = time.time() - start_time
                             logger.info(
-                                f"Batch segmentiert in {elapsed:.2f}s "
+                                f"Batch segmented in {elapsed:.2f}s "
                                 f"({elapsed/len(batch_images):.3f}s/plane, "
                                 f"{elapsed/len(cell_batch_data):.3f}s/cell)"
                             )
@@ -244,18 +246,8 @@ def segment_nuclei_cellpose_direct(
                                 f"shape: {masks_batch.shape if hasattr(masks_batch, 'shape') else f'len={len(masks_batch)}'}, "
                                 f"dtype: {masks_batch.dtype if hasattr(masks_batch, 'dtype') else 'N/A'}"
                             )
-                            if (
-                                hasattr(masks_batch, "shape")
-                                and len(masks_batch.shape) >= 2
-                            ):
-                                logger.info(
-                                    f"First mask unique values: {np.unique(masks_batch[0])[:10]}"
-                                )
-                                logger.info(
-                                    f"First mask nuclei count: {len(np.unique(masks_batch[0])) - 1}"
-                                )
 
-                            # Verteile Ergebnisse zurück zu den Zellen
+                            # Distribute results back to cells
                             mask_idx = 0
                             for cell_data in cell_batch_data:
                                 cell_name = cell_data["cell_name"]
@@ -264,14 +256,13 @@ def segment_nuclei_cellpose_direct(
                                 selected_planes = cell_data["selected_planes"]
                                 cell_images = cell_data["images"]
 
-                                # Speichere Segmentierungsergebnisse für alle Planes dieser Zelle
-                                cell_nuclei_count = 0
+                                # Save segmentation results for all planes of this cell
                                 for plane_idx, plane_name in enumerate(selected_planes):
                                     masks = masks_batch[mask_idx]
                                     image_405 = cell_images[plane_idx]
                                     mask_idx += 1
 
-                                    # Speichere Segmentierungsmaske als uint16 mit Kompression
+                                    # Save segmentation mask as uint16 with compression
                                     nuclei_seg_group.create_dataset(
                                         plane_name,
                                         data=masks.astype(np.uint16),
@@ -280,48 +271,23 @@ def segment_nuclei_cellpose_direct(
                                         shuffle=True,
                                     )
 
-                                    # Zähle Nukleai
-                                    nuclei_in_plane = (
-                                        len(np.unique(masks)) - 1
-                                    )  # -1 für Hintergrund
-                                    cell_nuclei_count += nuclei_in_plane
-                                    total_nuclei += nuclei_in_plane
-
-                                    logger.debug(
-                                        f"  {cell_name}/{plane_name}: {nuclei_in_plane} Nukleai"
-                                    )
-
-                                    # Visualisierung (optional, nur erste 3 Zellen)
-                                    if visualize and cell_idx_local < 3:
-                                        visualize_segmentation_result(
-                                            image_405,
-                                            masks,
-                                            f"{cell_name}_{plane_name}",
-                                        )
-
-                                # Speichere Zell-Metadaten
-                                nuclei_seg_group.attrs["nuclei_count"] = (
-                                    cell_nuclei_count
-                                )
+                                # Save cell metadata
                                 nuclei_seg_group.attrs["planes_processed"] = len(
                                     selected_planes
                                 )
 
                                 processed_count += 1
 
-                            # Leere Batch für nächste Iteration
+                            # Clear batch for next iteration
                             cell_batch_data = []
                             logger.info(
-                                f"Progress: {processed_count}/{total_cells} cells processed, "
-                                f"{total_nuclei} nuclei found so far"
+                                f"Progress: {processed_count}/{total_cells} cells processed"
                             )
 
                     except Exception as e:
-                        logger.error(
-                            f"Fehler bei Vorbereitung von Zelle {cell_name}: {e}"
-                        )
+                        logger.error(f"Error preparing cell {cell_name}: {e}")
                         failed_count += 1
-                        # Entferne fehlgeschlagene Zelle aus Batch
+                        # Remove failed cell from batch
                         cell_batch_data = [
                             c for c in cell_batch_data if c["cell_name"] != cell_name
                         ]
@@ -334,164 +300,81 @@ def segment_nuclei_cellpose_direct(
     finally:
         logger.info("Ensuring all resources are properly released")
 
-    # Zusammenfassung
+    # Close tqdm file if it was opened
+    if tqdm_file and tqdm_file != sys.stderr:
+        try:
+            tqdm_file.close()
+        except:
+            pass
+
+    # Summary
     logger.info("=" * 50)
-    logger.info("SEGMENTIERUNG ABGESCHLOSSEN")
+    logger.info("SEGMENTATION COMPLETED")
     logger.info("=" * 50)
-    logger.info(f"Verarbeitete Zellen: {processed_count}")
-    logger.info(f"Fehlgeschlagene Zellen: {failed_count}")
-    logger.info(f"Gefundene Nukleai gesamt: {total_nuclei}")
-    if processed_count > 0:
-        logger.info(f"Durchschnitt: {total_nuclei/processed_count:.1f} Nukleai/Zelle")
-    logger.info(f"Output gespeichert: {output_h5_path}")
+    logger.info(f"Processed cells: {processed_count}")
+    logger.info(f"Failed cells: {failed_count}")
+    logger.info(f"Output saved: {output_h5_path}")
 
     return {
         "processed_cells": processed_count,
         "failed_cells": failed_count,
-        "total_nuclei": total_nuclei,
         "output_path": output_h5_path,
     }
 
 
-def visualize_segmentation_result(image, masks, title):
-    """
-    Visualisiert ein Segmentierungsergebnis.
-    """
-    fig, axes = plt.subplots(1, 3, figsize=(12, 4))
-
-    # Original Bild
-    axes[0].imshow(image, cmap="gray")
-    axes[0].set_title(f"{title}\nOriginal 405")
-    axes[0].axis("off")
-
-    # Segmentierungsmasken
-    axes[1].imshow(masks, cmap="tab10")
-    nuclei_count = len(np.unique(masks)) - 1
-    axes[1].set_title(f"Segmentierung\n{nuclei_count} Nukleai")
-    axes[1].axis("off")
-
-    # Overlay
-    axes[2].imshow(image, cmap="gray", alpha=0.7)
-    axes[2].imshow(masks, cmap="tab10", alpha=0.3)
-    axes[2].set_title("Overlay")
-    axes[2].axis("off")
-
-    plt.tight_layout()
-    plt.show()
-
-
-def verify_nuclei_segmentation(h5_path, sample_cells=3):
-    """
-    Überprüft die nuclei_seg Daten in einer H5-Datei.
-
-    Parameter:
-    - h5_path: Pfad zur H5-Datei
-    - sample_cells: Anzahl Zellen zur Stichprobenprüfung
-    """
-    logger.info(f"Überprüfe nuclei_seg in: {h5_path}")
-
-    with h5py.File(h5_path, "r") as f:
-        cell_names = list(f.keys())
-        cells_with_nuclei_seg = 0
-        total_nuclei = 0
-
-        for i, cell_name in enumerate(cell_names[:sample_cells]):
-            cell_group = f[cell_name]
-            logger.info(f"\nZelle {cell_name}:")
-            logger.info(f"  Kanäle: {list(cell_group.keys())}")
-
-            if "nuclei_seg" in cell_group:
-                cells_with_nuclei_seg += 1
-                nuclei_group = cell_group["nuclei_seg"]
-                planes = list(nuclei_group.keys())
-
-                logger.info(f"  nuclei_seg: {len(planes)} Planes")
-
-                # Metadaten
-                if nuclei_group.attrs:
-                    logger.info("  Metadaten:")
-                    for key in nuclei_group.attrs.keys():
-                        logger.info(f"    {key}: {nuclei_group.attrs[key]}")
-
-                # Prüfe erste Plane
-                if planes:
-                    first_plane_data = nuclei_group[planes[0]][()]
-                    unique_labels = np.unique(first_plane_data)
-                    nuclei_count = len(unique_labels) - 1
-                    total_nuclei += nuclei_count
-
-                    logger.info(
-                        f"    Plane {planes[0]}: {first_plane_data.shape}, "
-                        f"{nuclei_count} Nukleai, dtype: {first_plane_data.dtype}"
-                    )
-            else:
-                logger.info(f"  ❌ Keine nuclei_seg gefunden")
-
-        logger.info(f"\nZUSAMMENFASSUNG:")
-        logger.info(f"Zellen mit nuclei_seg: {cells_with_nuclei_seg}/{len(cell_names)}")
-        logger.info(f"Nukleai in Stichprobe: {total_nuclei}")
-
-
 def main():
     parser = argparse.ArgumentParser(
-        description="Nukleisegmentierung mit Cellpose - Direkte H5-Verarbeitung"
+        description="Nuclei segmentation with Cellpose - Direct H5 processing"
     )
-    parser.add_argument(
-        "--path", type=str, required=True, help="Pfad zur Input H5-Datei"
-    )
+    parser.add_argument("--path", type=str, required=True, help="Path to input H5 file")
     parser.add_argument(
         "--output_path",
         type=str,
-        default=None,
-        help="Pfad zur Output H5-Datei (default: neue Datei in /myhome/iris)",
+        required=True,
+        help="Path to output H5 file (default: new file in /myhome/iris)",
     )
-    parser.add_argument(
-        "--gpu", action="store_true", help="GPU für Segmentierung verwenden"
-    )
-    parser.add_argument(
-        "--visualize",
-        action="store_true",
-        help="Segmentierungsergebnisse visualisieren",
-    )
+    parser.add_argument("--gpu", action="store_true", help="Use GPU for segmentation")
+
     parser.add_argument(
         "--model_type",
         type=str,
         default="nuclei",
         choices=["nuclei", "cyto", "cyto2"],
-        help="Cellpose-Modelltyp (default: nuclei)",
+        help="Cellpose model type (default: nuclei)",
     )
     parser.add_argument(
         "--diameter",
         type=int,
         default=None,
-        help="Nukleaidurchmesser in Pixeln (default: automatisch)",
+        help="Nucleus diameter in pixels (default: automatic)",
     )
     parser.add_argument(
         "--max_cells",
         type=int,
         default=None,
-        help="Maximale Anzahl zu verarbeitender Zellen",
+        help="Maximum number of cells to process",
     )
     parser.add_argument(
         "--plane_selection",
         type=str,
         default="all",
         choices=["middle", "first", "last", "all"],
-        help="Welche Planes verarbeiten (default: all)",
+        help="Which planes to process (default: all)",
     )
     parser.add_argument(
         "--cells_per_batch",
         type=int,
         default=10,
-        help="Anzahl Zellen pro Batch für Inferenz (default: 10, höher=schneller aber mehr GPU Memory)",
+        help="Number of cells per batch for inference (default: 10, higher=faster but more GPU memory)",
     )
     parser.add_argument(
-        "--overwrite", action="store_true", help="Bestehende nuclei_seg überschreiben"
+        "--log_file",
+        type=str,
+        default=None,
+        help="Path to log file for tqdm progress (default: auto-generated)",
     )
     parser.add_argument(
-        "--verify",
-        action="store_true",
-        help="nuclei_seg Daten nach Verarbeitung überprüfen",
+        "--overwrite", action="store_true", help="Overwrite existing nuclei_seg"
     )
 
     args = parser.parse_args()
@@ -499,8 +382,12 @@ def main():
     # Setup logging
     log_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "logs")
     os.makedirs(log_dir, exist_ok=True)
-    log_filename = os.path.join(
-        log_dir, f"segment_nuclei_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+    log_filename = (
+        args.log_file
+        if args.log_file
+        else os.path.join(
+            log_dir, f"segment_nuclei_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+        )
     )
     logging.basicConfig(
         filename=log_filename,
@@ -508,38 +395,43 @@ def main():
         format="%(asctime)s - %(levelname)s - %(message)s",
     )
 
-    # Überprüfe ob Input-Datei existiert
+    # Also log to console
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.INFO)
+    console_handler.setFormatter(
+        logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+    )
+    logging.getLogger().addHandler(console_handler)
+
+    logger.info(f"Log file: {log_filename}")
+
+    # Check if input file exists
     if not os.path.exists(args.path):
-        logger.error(f"Input-Datei nicht gefunden: {args.path}")
+        logger.error(f"Input file not found: {args.path}")
         return 1
 
     try:
-        # Führe Segmentierung durch
-        logger.info("Starte Nukleisegmentierung...")
+        # Run segmentation
+        logger.info("Starting nuclei segmentation...")
         results = segment_nuclei_cellpose_direct(
             h5_path=args.path,
             output_h5_path=args.output_path,
             gpu=args.gpu,
-            visualize=args.visualize,
             model_type=args.model_type,
             diameter=args.diameter,
             max_cells=args.max_cells,
             plane_selection=args.plane_selection,
             overwrite=args.overwrite,
             cells_per_batch=args.cells_per_batch,
+            log_file=log_filename,  # Use same log file for tqdm
         )
 
-        logger.info("Segmentierung erfolgreich abgeschlossen!")
-
-        # Überprüfung (falls gewünscht)
-        if args.verify:
-            logger.info("Überprüfe nuclei_seg Daten...")
-            verify_nuclei_segmentation(results["output_path"])
+        logger.info("Segmentation completed successfully!")
 
         return 0
 
     except Exception as e:
-        logger.error(f"Fehler bei Segmentierung: {e}")
+        logger.error(f"Error during segmentation: {e}")
         import traceback
 
         traceback.print_exc()
