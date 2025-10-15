@@ -142,16 +142,11 @@ class NormalizeTransform(ChannelTransform):
         self,
         channel_keys: Optional[List[str]] = None,
         method: str = "minmax",  # 'minmax', 'percentile'
-        clip_percentiles: tuple = (1, 99),
-        target_range: tuple = (0, 1),
     ):
         super().__init__(channel_keys)
         self.method = method
-        self.clip_percentiles = clip_percentiles
-        self.target_range = target_range
 
     def transform_image(self, image: np.ndarray) -> np.ndarray:
-        image = image.astype(np.float32)
 
         if self.method == "minmax":
             min_val = image.min()
@@ -159,7 +154,7 @@ class NormalizeTransform(ChannelTransform):
             if max_val - min_val > 0:
                 normalized = (image - min_val) / (max_val - min_val)
             else:
-                normalized = image
+                normalized = image / max_val
 
         elif self.method == "standardize":
             mean = image.mean()
@@ -172,10 +167,6 @@ class NormalizeTransform(ChannelTransform):
         else:
             raise ValueError(f"Unknown normalization method: {self.method}")
 
-        # Scale to target range
-        min_target, max_target = self.target_range
-        normalized = normalized * (max_target - min_target) + min_target
-
         return normalized
 
     def get_config(self) -> Dict[str, Any]:
@@ -183,8 +174,6 @@ class NormalizeTransform(ChannelTransform):
             "type": "NormalizeTransform",
             "channel_keys": self.channel_keys,
             "method": self.method,
-            "clip_percentiles": self.clip_percentiles,
-            "target_range": self.target_range,
         }
 
 
@@ -323,7 +312,8 @@ class StackChannelsTransform(Transform):
                 # Add each plane as a channel
                 for plane in planes:
                     stacked_planes.append(plane)
-
+            else:
+                raise ValueError(f"Channel {key} not found in cell data")
         if stacked_planes:
             # Stack into (C, H, W) array
             data.channels = {"stacked": np.array(stacked_planes)}
