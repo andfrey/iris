@@ -12,7 +12,7 @@ import lightning as L
 import yaml
 from functools import partial
 
-from .data_sources import DataSource, H5DataSource, FilteredDataSource
+from .data_sources import DataSource, H5DataSource, FilteredDataSource, CellData
 from .data_transforms import Transform, TransformPipeline
 from .data_filters import (
     PlaneCountFilter,
@@ -299,7 +299,7 @@ class ModularCellDataset(Dataset):
         cell_data = self.data_source.load_cell(cell_id)
 
         # Compute FUCCI labels (488 and 561 intensities)
-        labels = self._compute_fucci_labels(cell_data)
+        labels = compute_fucci_labels(cell_data, debug=self.debug)
 
         # Apply transforms
         if self.transform:
@@ -332,55 +332,56 @@ class ModularCellDataset(Dataset):
 
         return images_tensor, labels_tensor
 
-    def _compute_fucci_labels(self, cell_data) -> np.ndarray:
-        """
-        Compute FUCCI intensities (488 and 561) from cell data.
 
-        Returns:
-            Array of shape (2,) with [intensity_488, intensity_561]
-        """
-        labels = []
-        # Only compute mean intensity within the cell mask
-        if not hasattr(cell_data, "segmentation") or cell_data.segmentation is None:
-            # No mask available, fall back to computing over entire image
-            raise ValueError("Missing segmentation mask for intensity computation")
+def compute_fucci_labels(cell_data: CellData, debug: bool = False) -> np.ndarray:
+    """
+    Compute FUCCI intensities (488 and 561) from cell data.
 
-        # Compute intensity only within the masked region
-        labels = []
-        for channel in ["488", "561"]:
-            if channel in cell_data.channels:
-                planes = cell_data.channels[channel]
-                masks = cell_data.segmentation
-                if len(planes) != len(masks):
-                    raise ValueError(
-                        f"Channel {channel} planes and segmentation planes count mismatch"
+    Returns:
+        Array of shape (2,) with [intensity_488, intensity_561]
+    """
+    labels = []
+    # Only compute mean intensity within the cell mask
+    if not hasattr(cell_data, "segmentation") or cell_data.segmentation is None:
+        # No mask available, fall back to computing over entire image
+        raise ValueError("Missing segmentation mask for intensity computation")
+
+    # Compute intensity only within the masked region
+    labels = []
+    for channel in ["488", "561"]:
+        if channel in cell_data.channels:
+            planes = cell_data.channels[channel]
+            masks = cell_data.segmentation
+            if len(planes) != len(masks):
+                raise ValueError(
+                    f"Channel {channel} planes and segmentation planes count mismatch"
+                )
+            # Compute mean intensity only within mask for each plane
+            intensities = []
+            for plane, mask in zip(planes, masks):
+                mean_outside_mask = plane[mask == 0].mean()
+                plane_normalized = plane - mean_outside_mask  # Background subtraction
+                plane_normalized = np.clip(
+                    plane_normalized, 0, None
+                )  # Remove negatives
+                if debug:
+                    show_images(
+                        [plane, mask, plane_normalized],
+                        titles=[f"{channel} plane", "Mask", "Normalized"],
                     )
-                # Compute mean intensity only within mask for each plane
-                intensities = []
-                for plane, mask in zip(planes, masks):
-                    mean_outside_mask = plane[mask == 0].mean()
-                    plane_normalized = (
-                        plane - mean_outside_mask
-                    )  # Background subtraction
-                    plane_normalized = np.clip(
-                        plane_normalized, 0, None
-                    )  # Remove negatives
-                    if self.debug:
-                        show_images(
-                            [plane, mask, plane_normalized],
-                            titles=[f"{channel} plane", "Mask", "Normalized"],
-                        )
-                    masked_values = plane_normalized[mask > 0]
-                    if len(masked_values) > 0:
-                        intensities.append(masked_values.mean())
+                masked_values = plane_normalized[mask > 0]
+                if len(masked_values) > 0:
+                    intensities.append(masked_values.mean())
 
-                mean_intensity = np.mean(intensities)
-                log_mean_intensity = np.log(mean_intensity)  # Log normalization
-                labels.append(log_mean_intensity)
-            else:
-                raise ValueError(f"Channel {channel} not found in cell data")
+            mean_intensity = np.mean(intensities)
+            log_mean_intensity = (
+                np.log(mean_intensity) if mean_intensity > 0 else 0
+            )  # Log normalization
+            labels.append(log_mean_intensity)
+        else:
+            raise ValueError(f"Channel {channel} not found in cell data")
 
-        return np.array(labels, dtype=np.float32)
+    return np.array(labels, dtype=np.float32)
 
 
 def show_images(images: List[np.ndarray], titles: Optional[List[str]] = None):
