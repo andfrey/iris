@@ -26,7 +26,6 @@ class ConvBlock(nn.Module):
         kernel_size: int = 3,
         stride: int = 1,
         padding: int = 1,
-        dropout: float = 0.1,
         use_batchnorm: bool = True,
     ):
         super().__init__()
@@ -37,9 +36,6 @@ class ConvBlock(nn.Module):
             layers.append(nn.BatchNorm2d(out_channels))
 
         layers.append(nn.ReLU(inplace=True))
-
-        if dropout > 0:
-            layers.append(nn.Dropout2d(dropout))
 
         self.block = nn.Sequential(*layers)
 
@@ -106,13 +102,6 @@ class CNet(L.LightningModule):
                     ConvBlock(
                         current_channels,
                         out_channels,
-                        dropout=dropout,
-                        use_batchnorm=use_batchnorm,
-                    ),
-                    ConvBlock(
-                        out_channels,
-                        out_channels,
-                        dropout=dropout,
                         use_batchnorm=use_batchnorm,
                     ),
                     nn.MaxPool2d(2, 2),
@@ -159,9 +148,8 @@ class CNet(L.LightningModule):
             x = x.float()
 
         # Convolutional blocks
-        for i, block in enumerate(self.conv_blocks):
+        for block in self.conv_blocks:
             x = block(x)
-            # Check for NaN after each block
 
         # Global pooling
         x = self.global_pool(x)
@@ -227,7 +215,7 @@ class CNet(L.LightningModule):
         # Select optimizer
         if self.optimizer_name.lower() == "adam":
             optimizer = Adam(
-                self.parameters(), lr=self.learning_rate, weight_decay=self.weight_decay
+                self.parameters(), lr=self.learning_rate,
             )
         elif self.optimizer_name.lower() == "adamw":
             optimizer = AdamW(
@@ -246,18 +234,15 @@ class CNet(L.LightningModule):
         # Select scheduler
         if self.scheduler_name is None:
             return optimizer
-
         if self.scheduler_name.lower() == "plateau":
             scheduler = ReduceLROnPlateau(
-                optimizer, mode="min", factor=0.5, patience=5, verbose=True
+                optimizer, min_lr=1e-6
             )
             return {
                 "optimizer": optimizer,
                 "lr_scheduler": {
                     "scheduler": scheduler,
                     "monitor": "val_loss",
-                    "interval": "epoch",
-                    "frequency": 1,
                 },
             }
         elif self.scheduler_name.lower() == "cosine":
@@ -356,142 +341,4 @@ class ResidualBlock(nn.Module):
         return out
 
 
-class CNetLite(CNet):
-    """
-    Lightweight variant of CNet for faster training and inference.
 
-    Suitable for quick experiments or resource-constrained environments.
-    """
-
-    def __init__(self, *args, **kwargs):
-        # Modify default parameters for lighter network
-        kwargs.setdefault("num_blocks", 3)
-        kwargs.setdefault("base_filters", 16)
-        kwargs.setdefault("fc_hidden_dims", [128])
-        kwargs.setdefault("task", "regression")
-
-        super().__init__(*args, **kwargs)
-
-
-# Factory function for easy model creation
-def create_cnet(
-    variant: str = "standard",
-    in_channels: int = 4,
-    output_dim: int = 2,
-    task: str = "regression",
-    **kwargs,
-) -> L.LightningModule:
-    """
-    Factory function to create CNet models.
-
-    Args:
-        variant: Model variant ('standard', 'deep', 'lite')
-        in_channels: Number of input channels
-        output_dim: Output dimension (2 for 2D regression, or num_classes for classification)
-        task: Task type ('regression' or 'classification')
-        **kwargs: Additional arguments passed to model constructor
-
-    Returns:
-        CNet model instance
-
-    Examples:
-        >>> # For 2D regression (e.g., predicting x, y coordinates)
-        >>> model = create_cnet('standard', in_channels=4, output_dim=2, task='regression')
-        >>>
-        >>> # For classification
-        >>> model = create_cnet('standard', in_channels=4, output_dim=3, task='classification')
-        >>>
-        >>> # Deep variant with custom parameters
-        >>> model = create_cnet('deep', in_channels=1, output_dim=2, task='regression', learning_rate=1e-4)
-    """
-    variant = variant.lower()
-
-    if variant == "standard":
-        return CNet(in_channels=in_channels, output_dim=output_dim, task=task, **kwargs)
-    elif variant == "deep":
-        return CNetDeep(
-            in_channels=in_channels, output_dim=output_dim, task=task, **kwargs
-        )
-    elif variant == "lite":
-        return CNetLite(
-            in_channels=in_channels, output_dim=output_dim, task=task, **kwargs
-        )
-    else:
-        raise ValueError(
-            f"Unknown variant: {variant}. Choose from 'standard', 'deep', 'lite'"
-        )
-
-
-if __name__ == "__main__":
-    # Test model creation
-    print("Testing CNet models...")
-
-    # Test 1: Regression model (2D output)
-    print("\n" + "=" * 60)
-    print("Test 1: Regression Model (2D continuous output)")
-    print("=" * 60)
-    model_reg = create_cnet("standard", in_channels=4, output_dim=2, task="regression")
-    print(f"\nStandard CNet (Regression):")
-    print(f"  Total parameters: {sum(p.numel() for p in model_reg.parameters()):,}")
-    print(
-        f"  Trainable parameters: {sum(p.numel() for p in model_reg.parameters() if p.requires_grad):,}"
-    )
-
-    # Test forward pass for regression
-    batch_size = 8
-    x = torch.randn(batch_size, 4, 128, 128)
-    y_reg = torch.randn(batch_size, 2)  # 2D continuous targets
-
-    output_reg = model_reg(x)
-    print(f"  Input shape: {x.shape}")
-    print(f"  Output shape: {output_reg.shape}")
-    print(f"  Output range: [{output_reg.min():.2f}, {output_reg.max():.2f}]")
-
-    # Test training step
-    loss_reg = model_reg.criterion(output_reg, y_reg)
-    mae = F.l1_loss(output_reg, y_reg)
-    print(f"  MSE Loss: {loss_reg.item():.4f}")
-    print(f"  MAE: {mae.item():.4f}")
-
-    # Test 2: Classification model
-    print("\n" + "=" * 60)
-    print("Test 2: Classification Model (3 classes)")
-    print("=" * 60)
-    model_cls = create_cnet(
-        "standard", in_channels=4, output_dim=3, task="classification"
-    )
-    print(f"\nStandard CNet (Classification):")
-    print(f"  Total parameters: {sum(p.numel() for p in model_cls.parameters()):,}")
-
-    y_cls = torch.randint(0, 3, (batch_size,))
-    output_cls = model_cls(x)
-    loss_cls = model_cls.criterion(output_cls, y_cls)
-    print(f"  Input shape: {x.shape}")
-    print(f"  Output shape: {output_cls.shape}")
-    print(f"  CrossEntropy Loss: {loss_cls.item():.4f}")
-
-    # Test 3: Deep model for regression
-    print("\n" + "=" * 60)
-    print("Test 3: Deep Regression Model")
-    print("=" * 60)
-    model_deep = create_cnet("deep", in_channels=4, output_dim=2, task="regression")
-    print(f"\nDeep CNet (Regression):")
-    print(f"  Total parameters: {sum(p.numel() for p in model_deep.parameters()):,}")
-
-    output_deep = model_deep(x)
-    print(f"  Output shape: {output_deep.shape}")
-
-    # Test 4: Lite model for regression
-    print("\n" + "=" * 60)
-    print("Test 4: Lite Regression Model")
-    print("=" * 60)
-    model_lite = create_cnet("lite", in_channels=4, output_dim=2, task="regression")
-    print(f"\nLite CNet (Regression):")
-    print(f"  Total parameters: {sum(p.numel() for p in model_lite.parameters()):,}")
-
-    output_lite = model_lite(x)
-    print(f"  Output shape: {output_lite.shape}")
-
-    print("\n" + "=" * 60)
-    print("✓ All tests passed!")
-    print("=" * 60)
