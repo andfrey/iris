@@ -10,12 +10,9 @@ import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.data_pipeline.data_transforms import (
-    Transform,
-    ChannelTransform,
     SelectPlanesTransform,
     NormalizeTransform,
     GaussianFilterTransform,
-    StackChannelsTransform,
     TransformPipeline,
 )
 from src.data_pipeline.data_sources import CellData
@@ -240,75 +237,6 @@ class TestGaussianFilterTransform:
         assert std_large < std_small
 
 
-class TestStackChannelsTransform:
-    """Test StackChannelsTransform."""
-
-    def test_stack_two_channels(self):
-        """Test stacking two channels."""
-        transform = StackChannelsTransform(channel_order=["bf", "405"])
-
-        channels = {"bf": [np.ones((250, 250)) * 1], "405": [np.ones((250, 250)) * 2]}
-        cell_data = CellData(
-            cell_id="test", channels=channels, segmentation=[np.zeros((250, 250))]
-        )
-
-        result = transform(cell_data)
-
-        # Should have 'stacked' channel
-        assert "stacked" in result.channels
-        stacked = result.channels["stacked"]
-
-        # Should be (2, 250, 250) - 2 channels stacked
-        assert stacked.shape == (2, 250, 250)
-        assert stacked[0, 0, 0] == 1  # bf
-        assert stacked[1, 0, 0] == 2  # 405
-
-    def test_stack_with_multiple_planes(self):
-        """Test stacking channels with multiple planes."""
-        transform = StackChannelsTransform(channel_order=["bf", "405"])
-
-        channels = {
-            "bf": [
-                np.ones((250, 250)) * 1,
-                np.ones((250, 250)) * 2,
-                np.ones((250, 250)) * 3,
-            ],
-            "405": [
-                np.ones((250, 250)) * 4,
-                np.ones((250, 250)) * 5,
-                np.ones((250, 250)) * 6,
-            ],
-        }
-        cell_data = CellData(
-            cell_id="test", channels=channels, segmentation=[np.zeros((250, 250))] * 3
-        )
-
-        result = transform(cell_data)
-
-        # Should stack all planes: 2 channels × 3 planes = 6 total
-        assert "stacked" in result.channels
-        stacked = result.channels["stacked"]
-        assert stacked.shape == (6, 250, 250)
-
-        # Check ordering: bf_p0, bf_p1, bf_p2, 405_p0, 405_p1, 405_p2
-        assert stacked[0, 0, 0] == 1  # bf plane 0
-        assert stacked[1, 0, 0] == 2  # bf plane 1
-        assert stacked[2, 0, 0] == 3  # bf plane 2
-        assert stacked[3, 0, 0] == 4  # 405 plane 0
-
-    def test_missing_channel_in_order(self):
-        """Test error when channel in order doesn't exist."""
-        transform = StackChannelsTransform(channel_order=["bf", "nonexistent"])
-
-        channels = {"bf": [np.ones((250, 250))]}
-        cell_data = CellData(
-            cell_id="test", channels=channels, segmentation=[np.zeros((250, 250))]
-        )
-
-        with pytest.raises((KeyError, ValueError)):
-            transform(cell_data)
-
-
 class TestTransformPipeline:
     """Test TransformPipeline."""
 
@@ -348,7 +276,6 @@ class TestTransformPipeline:
             SelectPlanesTransform(plane_selection="middle"),
             NormalizeTransform(method="minmax", channel_keys=["bf", "405"]),
             GaussianFilterTransform(sigma=1.0, channel_keys=["bf", "405"]),
-            StackChannelsTransform(channel_order=["bf", "405"]),
         ]
         pipeline = TransformPipeline(transforms)
 
@@ -370,16 +297,11 @@ class TestTransformPipeline:
 
         result = pipeline(cell_data)
 
-        # Final result should have stacked channels
-        assert "stacked" in result.channels
-        stacked = result.channels["stacked"]
-
-        # 2 channels (after selecting middle plane)
-        assert stacked.shape == (2, 250, 250)
+        assert np.sum(result.segmentation - cell_data.segmentation[0]) == 0
 
         # Should be normalized [0, 1]
-        assert stacked.min() >= 0
-        assert stacked.max() <= 1
+        assert result.channels["405"][0].min() >= 0
+        assert result.channels["405"][0].max() <= 1
 
     def test_get_config(self):
         """Test getting pipeline configuration."""

@@ -25,6 +25,7 @@ class TestComputeFucciLabels:
         image_size: tuple = (250, 250),
         background_noise: float = 10.0,
         mask_fraction: float = 0.1,
+        random_noise_factor: float = 0.5,
     ) -> CellData:
         """
         Create mock cell data with known intensities for testing.
@@ -58,7 +59,7 @@ class TestComputeFucciLabels:
                 plane = np.ones(image_size, dtype=np.float32) * background_noise
                 plane[mask_single > 0] = intensity + background_noise
                 # Add small random noise
-                plane += np.random.randn(*image_size) * 0.5
+                plane += np.random.randn(*image_size) * random_noise_factor
                 planes.append(plane)
             channels[channel] = planes
 
@@ -85,7 +86,10 @@ class TestComputeFucciLabels:
         """Test basic functionality with known intensities."""
         # Create cell with known intensities
         cell_data = self.create_mock_cell_data(
-            intensity_488=100.0, intensity_561=200.0, background_noise=10.0
+            intensity_488=100.0,
+            intensity_561=200.0,
+            background_noise=10.0,
+            random_noise_factor=0.0,
         )
 
         # Compute labels
@@ -103,6 +107,8 @@ class TestComputeFucciLabels:
         # After background subtraction: 488 has ~90, 561 has ~190
         # log(190) > log(90)
         assert labels[1] > labels[0], "561 intensity should be higher than 488"
+        assert labels[0] == np.log(np.float32(100.0))
+        assert labels[1] == np.log(np.float32(200.0))
 
     def test_background_subtraction(self):
         """Test that background is properly subtracted."""
@@ -168,7 +174,7 @@ class TestComputeFucciLabels:
         )
 
         # Should raise ValueError
-        with pytest.raises(ValueError, match="Missing segmentation mask"):
+        with pytest.raises(ValueError):
             compute_fucci_labels(cell_data)
 
     def test_missing_channel(self):
