@@ -30,12 +30,7 @@ def resolve(name: str):
 
 class ModularCellDataModule(L.LightningDataModule):
     """
-    Lightning DataModule using the new modular architecture.
-
-    This DataModule works with Lightning CLI for easy configuration.
-
-    Example usage with CLI:
-        lightning run model --data ModularCellDataModule --model CNet
+    Lightning DataModule for the cell dataset.
 
     Example config:
         data:
@@ -61,30 +56,29 @@ class ModularCellDataModule(L.LightningDataModule):
     ):
         """
         Args:
-            h5_path: Path to H5 file
-            batch_size: Batch size for dataloaders
-            num_workers: Number of workers for dataloaders (use 0 for A100)
-            train_val_split: Train/validation split ratios [train, val]
+            data_config_path: Path to YAML config file with data parameters
+                            h5_path: Path to H5 file
+                            batch_size: Batch size for dataloaders
+                            num_workers: Number of workers for dataloaders
+                            train_val_split: Train/validation split ratios [train, val]
 
-            Filter parameters:
-            use_quality_filters: Whether to apply quality filters
-            plane_count: Expected number of planes per channel
-            max_objects: Maximum objects in segmentation mask
-            min_seg_pixels: Minimum pixels in segmentation mask
-            max_nuclei_ratio: Maximum nuclei/cell area ratio
-            force_refilter: Force re-filtering even if cache exists
+                            Filter parameters:
+                            use_quality_filters: Whether to apply quality filters
+                            plane_count: Expected number of planes per channel
+                            max_objects: Maximum objects in segmentation mask
+                            min_seg_pixels: Minimum pixels in segmentation mask
+                            max_nuclei_ratio: Maximum nuclei/cell area ratio
+                            force_refilter: Force re-filtering even if cache exists
 
-            Transform parameters:
-            plane_selection: Plane selection strategy ('middle', 'first', 'last', 'all')
-            normalize_method: Normalization method ('minmax' or 'percentile')
-            normalize_channels: Channels to normalize
-            apply_gaussian: Whether to apply Gaussian smoothing
-            gaussian_sigma: Sigma for Gaussian filter
-            gaussian_channels: Channels to apply Gaussian filter to
-            channel_order: Order of channels in output
-
-            Advanced:
-            seed: Random seed for reproducibility
+                            Transform parameters:
+                            plane_selection: Plane selection strategy ('middle', 'first', 'last', 'all')
+                            normalize_method: Normalization method ('minmax' or 'percentile')
+                            normalize_channels: Channels to normalize
+                            apply_gaussian: Whether to apply Gaussian smoothing
+                            gaussian_sigma: Sigma for Gaussian filter
+                            gaussian_channels: Channels to apply Gaussian filter to
+                            channel_order: Order of channels in output
+                            seed: Random seed for reproducibility
         """
         super().__init__()
         with open(data_config_path, "r") as f:
@@ -93,7 +87,7 @@ class ModularCellDataModule(L.LightningDataModule):
         self.save_hyperparameters(self.config)
 
         # Store parameters
-        self.h5_path = self.config.get("h5_path", "data/file.h5")
+        self.h5_path = self.config.get("h5_path", None)
         self.batch_size = self.config.get("batch_size", 64)
         self.num_workers = self.config.get("num_workers", 0)
         self.train_val_split = self.config.get("train_val_split", [0.8, 0.2])
@@ -116,10 +110,9 @@ class ModularCellDataModule(L.LightningDataModule):
         self.full_dataset = None
 
     def prepare_data(self):
-        """
-        Download or prepare data (runs on single GPU).
-        For H5 files, this mainly validates the file exists.
-        """
+        """Check if data exists"""
+        if self.h5_path is None:
+            raise ValueError("h5_path must be specified in data config")
         h5_path = Path(self.h5_path)
         if not h5_path.exists():
             raise FileNotFoundError(f"H5 file not found: {self.h5_path}")
@@ -271,6 +264,7 @@ class ModularCellDataset(Dataset):
         self,
         data_source: DataSource,
         transform: Optional[Transform] = None,
+        mask_intensity: str = "segment",
         debug: bool = False,
     ):
         """
@@ -280,6 +274,7 @@ class ModularCellDataset(Dataset):
         """
         self.data_source = data_source
         self.transform = transform
+        self.mask_intensity = mask_intensity
         self.debug = debug
         # Get cell IDs
         self.cell_ids = data_source.get_cell_ids()
@@ -299,27 +294,23 @@ class ModularCellDataset(Dataset):
         cell_data = self.data_source.load_cell(cell_id)
 
         # Compute FUCCI labels (488 and 561 intensities)
-        labels = compute_fucci_labels(cell_data, debug=self.debug)
+        labels = compute_fucci_labels(
+            cell_data, mask_intensity=self.mask_intensity, debug=self.debug
+        )
 
         # Apply transforms
         if self.transform:
             cell_data = self.transform(cell_data)
 
-        # Convert channels to tensor
-        if "stacked" in cell_data.channels:
-            # Already stacked by StackChannelsTransform
-            images = cell_data.channels["stacked"]
-        else:
-            # Stack manually
-            channel_list = []
-            for channel_name in ["bf", "405"]:
-                for plane in cell_data.channels.get(channel_name, None):
-                    if plane is None:
-                        raise ValueError(
-                            f"Missing channel {channel_name} for cell {cell_id}"
-                        )
-                    channel_list.append(plane)
-            images = np.array(channel_list)
+        channel_list = []
+        for channel_name in ["bf", "405"]:
+            for plane in cell_data.channels.get(channel_name, None):
+                if plane is None:
+                    raise ValueError(
+                        f"Missing channel {channel_name} for cell {cell_id}"
+                    )
+                channel_list.append(plane)
+        images = np.array(channel_list)
 
         # Ensure float32 and proper shape (C, H, W)
         images = images.astype(np.float32)
@@ -333,16 +324,20 @@ class ModularCellDataset(Dataset):
         return images_tensor, labels_tensor
 
 
-def compute_fucci_labels(cell_data: CellData, debug: bool = False) -> np.ndarray:
+def compute_fucci_labels(
+    cell_data: CellData, mask_intensity: str = "segmentation", debug: bool = False
+) -> np.ndarray:
     """
-    Compute FUCCI intensities (488 and 561) from cell data.
+    Compute FUCCI mean log intensities (488 and 561) from cell data within the specified mask.
 
     Returns:
         Array of shape (2,) with [intensity_488, intensity_561]
     """
     labels = []
-    # Only compute mean intensity within the cell mask
-    if not hasattr(cell_data, "segmentation") or cell_data.segmentation is None:
+    if mask_intensity not in ["segmentation", "nuclei_segmentation"]:
+        raise ValueError("mask_intensity must be 'segmentation' or 'nuclei_segmentation'")
+    # Only compute mean intensity within the mask_intensity region
+    if not hasattr(cell_data, mask_intensity):
         # No mask available, fall back to computing over entire image
         raise ValueError("Missing segmentation mask for intensity computation")
 
@@ -351,7 +346,11 @@ def compute_fucci_labels(cell_data: CellData, debug: bool = False) -> np.ndarray
     for channel in ["488", "561"]:
         if channel in cell_data.channels:
             planes = cell_data.channels[channel]
-            masks = cell_data.segmentation
+            masks = getattr(cell_data, mask_intensity)
+            if masks is None:
+                raise ValueError(
+                    f"Missing mask '{mask_intensity}' for intensity computation"
+                )
             if len(planes) != len(masks):
                 raise ValueError(
                     f"Channel {channel} planes and segmentation planes count mismatch"
@@ -371,11 +370,19 @@ def compute_fucci_labels(cell_data: CellData, debug: bool = False) -> np.ndarray
                     )
                 masked_values = plane_normalized[mask > 0]
                 if len(masked_values) > 0:
-                    intensities.append(masked_values.mean())
+                    masked_values_mean = masked_values.mean()
+                    if np.isnan(masked_values_mean):
+                        masked_values_mean = 0.0
+                    intensities.append(masked_values_mean)
 
+            if not intensities:
+                raise ValueError(f"No valid intensities found for channel {channel}")
             mean_intensity = np.mean(intensities)
+            assert mean_intensity <= max(
+                [plane.max() for plane in planes]
+            ), "Mean intensity exceeds max plane intensity"
             log_mean_intensity = (
-                np.log(mean_intensity) if mean_intensity > 0 else 0
+                np.log(mean_intensity) if mean_intensity > 0.0 else 0.0
             )  # Log normalization
             labels.append(log_mean_intensity)
         else:

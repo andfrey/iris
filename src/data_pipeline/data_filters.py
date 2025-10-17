@@ -78,70 +78,83 @@ class PlaneCountFilter(CellFilter):
 
 class MultipleObjectsFilter(CellFilter):
     """Filter cells with multiple objects in segmentation mask"""
-
-    def __init__(self, max_objects: int = 1):
+    object_class_mask_map = {
+        "cell": "segmentation",
+        "nuclei": "nuclei_segmentation",
+    }
+    def __init__(self, max_objects: int = 1, object_class: List[str] = ["cell", "nuclei"]):
         self.max_objects = max_objects
+        self.object_masks = [self.object_class_mask_map[cls] for cls in object_class]
 
     def __call__(self, cell_data) -> FilterResult:
         if cell_data.segmentation is None:
             return FilterResult(is_valid=False, reason="missing_segmentation")
+        for mask_attr in self.object_masks:
+            if not getattr(cell_data, mask_attr):
+                return FilterResult(is_valid=False, reason="missing_segmentation")
+            for i, seg in enumerate(getattr(cell_data, mask_attr)):
+                # Label connected components
+                labeled_mask = label(seg)
+                num_objects = labeled_mask.max()
 
-        # Get first plane if it's a list
-        seg = (
-            cell_data.segmentation[0]
-            if isinstance(cell_data.segmentation, list)
-            else cell_data.segmentation
-        )
-
-        # Label connected components
-        labeled_mask = label(seg)
-        num_objects = labeled_mask.max()
-
-        if num_objects > self.max_objects:
-            return FilterResult(
-                is_valid=False,
-                reason="multiple_cells",
-                metadata={
-                    "num_objects": int(num_objects),
-                    "max_allowed": self.max_objects,
-                },
-            )
+                if num_objects > self.max_objects:
+                    return FilterResult(
+                        is_valid=False,
+                        reason="multiple_cells",
+                        metadata={
+                            "num_objects": int(num_objects),
+                            "object_class": mask_attr,
+                            "max_allowed": self.max_objects,
+                            "plane_index": i,
+                        },
+                    )
 
         return FilterResult(is_valid=True)
 
     def get_name(self) -> str:
-        return f"MultipleObjects(max={self.max_objects})"
+        return f"MultipleObjects(max={self.max_objects}, object_classes={self.object_masks})"
 
 
 class EmptySegmentationFilter(CellFilter):
     """Filter cells where segmentation failed (empty mask)"""
 
-    def __init__(self, min_pixels: int = 10):
+    def __init__(self, min_pixels: int = 10, segmentations: List[str] = ["segmentation", "nuclei_segmentation"], planes_missing: str = "middle"):
         self.min_pixels = min_pixels
+        self.segmentations = segmentations
+        self.planes_missing = planes_missing
 
     def __call__(self, cell_data) -> FilterResult:
-        if cell_data.segmentation is None:
-            return FilterResult(is_valid=False, reason="missing_segmentation")
-
-        # Get first plane if it's a list
-        for seg in cell_data.segmentation:
-            num_pixels = np.sum(seg > 0)
-
-            if num_pixels < self.min_pixels:
-                return FilterResult(
-                    is_valid=False,
-                    reason="failed_segmentation",
-                    metadata={"num_pixels": int(num_pixels)},
-                )
-
+        for segmentation_attr in self.segmentations:
+            if not getattr(cell_data, segmentation_attr):
+                return FilterResult(is_valid=False, reason="missing_segmentation")
+            
+            for i, seg in enumerate(getattr(cell_data, segmentation_attr)):
+                if self.planes_missing == "first" and i != 0:
+                    continue
+                if self.planes_missing == "last" and i != len(getattr(cell_data, segmentation_attr)) - 1:
+                    continue
+                if self.planes_missing == "middle" and (i != len(getattr(cell_data, segmentation_attr)) // 2):
+                    continue
+                    
+                num_pixels = np.sum(seg > 0)
+                
+                if num_pixels < self.min_pixels:
+                    return FilterResult(
+                        is_valid=False,
+                        reason="failed_segmentation",
+                        metadata={"num_pixels": int(num_pixels)},
+                    )
+            
         return FilterResult(is_valid=True)
 
     def get_name(self) -> str:
-        return f"EmptySegmentation(min_pixels={self.min_pixels})"
+        return f"EmptySegmentation(min_pixels={self.min_pixels}, segmentations={self.segmentations}, planes_missing={self.planes_missing})"
 
 
 class NucleiSizeFilter(CellFilter):
-    """Filter cells where nuclei is too large compared to cell"""
+    """Filter cells where mask of the nucleus is larger than a threshold ratio of the cell mask
+    indicating a likely segmentation error.
+    """
 
     def __init__(self, max_ratio: float = 1.2):
         self.max_ratio = max_ratio
@@ -193,7 +206,7 @@ class NucleiSizeFilter(CellFilter):
 
 
 class CompositeFilter:
-    """Combines multiple filters with AND logic"""
+    """Combines multiple filters"""
 
     def __init__(self, filters: List[CellFilter]):
         self.filters = filters

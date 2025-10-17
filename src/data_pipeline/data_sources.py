@@ -22,11 +22,12 @@ class CellData:
     """Standardized cell data structure"""
 
     cell_id: str
-    channels: Dict[str, np.ndarray]  # e.g., {'405': array, '488': array}
+    channels: Dict[
+        str, List[np.ndarray]
+    ]  # e.g., {'405': [array1, array2], '488': [array1, array2]}
     metadata: Dict[str, Any] = field(default_factory=dict)
     segmentation: Optional[np.ndarray] = None
     nuclei_segmentation: Optional[np.ndarray] = None
-    labels: Optional[Dict[str, float]] = None
 
 
 class DataSource(ABC):
@@ -136,7 +137,7 @@ class H5DataSource(DataSource):
             return [group[()]]
 
         # It's a group with multiple planes
-        plane_keys = sorted(group.keys(), key=lambda x: int(x) if x.isdigit() else x)
+        plane_keys = group.keys()
 
         if self.plane_selection == "all":
             # Return all planes
@@ -181,7 +182,6 @@ class FilteredDataSource:
         self,
         data_source: DataSource,
         filters: List[CellFilter],
-        show_progress: bool = True,
         cache_results: bool = True,
         force_refilter: bool = False,
     ):
@@ -189,13 +189,11 @@ class FilteredDataSource:
         Args:
             data_source: Underlying data source
             filters: List of filters to apply
-            show_progress: Whether to show progress bar during filtering
             cache_results: Whether to cache filter results to file
             force_refilter: Force re-filtering even if cache exists
         """
         self.data_source = data_source
         self.composite_filter = CompositeFilter(filters)
-        self.show_progress = show_progress
         self.cache_results = cache_results
         self.force_refilter = force_refilter
 
@@ -281,13 +279,7 @@ class FilteredDataSource:
 
         self._filter_stats = FilterStatistics()
 
-        iterator = (
-            tqdm(all_cell_ids, desc="Filtering cells")
-            if self.show_progress
-            else all_cell_ids
-        )
-
-        for cell_id in iterator:
+        for cell_id in tqdm(all_cell_ids, desc="Filtering cells"):
             try:
                 cell_data = self.data_source.load_cell(cell_id)
                 result = self.composite_filter(cell_data)

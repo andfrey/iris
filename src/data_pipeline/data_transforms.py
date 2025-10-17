@@ -5,6 +5,7 @@ Composable transforms that can be chained together.
 
 from abc import ABC, abstractmethod
 from typing import Dict, Any, List, Optional
+import cv2
 import numpy as np
 from scipy import ndimage
 from copy import deepcopy
@@ -61,6 +62,7 @@ class CropTransform(Transform):
     def __init__(
         self,
         padding: int = 0,
+        dimension: int = 250
     ):
         """
         Args:
@@ -79,7 +81,7 @@ class CropTransform(Transform):
 
         # Handle list of planes
         if isinstance(mask, list):
-            mask = mask[0]  # Use first plane for bounding box
+            mask = mask[len(mask) // 2]  # Use middle plane for bounding box
 
         # Find bounding box of non-zero regions
         rows = np.any(mask, axis=1)
@@ -91,7 +93,12 @@ class CropTransform(Transform):
 
         rmin, rmax = np.where(rows)[0][[0, -1]]
         cmin, cmax = np.where(cols)[0][[0, -1]]
-
+        
+        crop_dim = max(rmax - rmin, cmax - cmin)
+        
+        padding_r = (crop_dim - (rmax - rmin)) // 2 + self.padding
+        padding_c = (crop_dim - (cmax - cmin)) // 2 + self.padding
+        
         # Add padding
         h, w = mask.shape
         rmin = max(0, rmin - self.padding)
@@ -103,35 +110,65 @@ class CropTransform(Transform):
         for key in data.channels:
             planes = data.channels[key]
             if isinstance(planes, list):
-                data.channels[key] = [plane[rmin:rmax, cmin:cmax] for plane in planes]
+                data.channels[key] = [self._fit_to_dimension(plane[rmin:rmax, cmin:cmax]) for plane in planes]
             else:
-                data.channels[key] = [planes[rmin:rmax, cmin:cmax]]
+                data.channels[key] = [self._fit_to_dimension(planes[rmin:rmax, cmin:cmax])]
 
         # Crop segmentation masks
         if data.segmentation is not None:
             if isinstance(data.segmentation, list):
                 data.segmentation = [
-                    plane[rmin:rmax, cmin:cmax] for plane in data.segmentation
+                    self._fit_to_dimension(plane[rmin:rmax, cmin:cmax]) for plane in data.segmentation
                 ]
             else:
-                data.segmentation = data.segmentation[rmin:rmax, cmin:cmax]
+                data.segmentation = self._fit_to_dimension(data.segmentation[rmin:rmax, cmin:cmax])
 
         if data.nuclei_segmentation is not None:
             if isinstance(data.nuclei_segmentation, list):
                 data.nuclei_segmentation = [
-                    plane[rmin:rmax, cmin:cmax] for plane in data.nuclei_segmentation
+                    self._fit_to_dimension(plane[rmin:rmax, cmin:cmax]) for plane in data.nuclei_segmentation
                 ]
             else:
-                data.nuclei_segmentation = data.nuclei_segmentation[
-                    rmin:rmax, cmin:cmax
-                ]
+                data.nuclei_segmentation = self._fit_to_dimension(data.nuclei_segmentation[rmin:rmax, cmin:cmax])
 
         return data
 
+    def _fit_to_dimension(self, image: np.ndarray) -> np.ndarray:
+        """Resize or pad image to target dimension"""
+        image_dim = image.shape[0]
+        target_dim = self.dimension
+    
+        # Crop if larger than target
+        if image_dim > target_dim:
+            image = cv2.resize(image, (target_dim, target_dim), interpolation=cv2.INTER_AREA)
+        else:
+            image = cv2.resize(image, (target_dim, target_dim), interpolation=cv2.INTER_CUBIC)
+        
+
+        # Pad if smaller than target
+        h, w = image.shape
+        pad_h = max(0, target_dim - h)
+        pad_w = max(0, target_dim - w)
+        pad_top = pad_h // 2
+        pad_bottom = pad_h - pad_top
+        pad_left = pad_w // 2
+        pad_right = pad_w - pad_left
+
+        if pad_h > 0 or pad_w > 0:
+            image = np.pad(
+                image,
+                ((pad_top, pad_bottom), (pad_left, pad_right)),
+                mode="constant",
+                constant_values=0,
+            )
+
+        return image
+    
     def get_config(self) -> Dict[str, Any]:
         return {
             "type": "CropTransform",
             "padding": self.padding,
+            "dimension": self.dimension,
         }
 
 
@@ -293,35 +330,6 @@ class RollingBallTransform(ChannelTransform):
             "channel_keys": self.channel_keys,
             "radius": self.radius,
         }
-
-
-class StackChannelsTransform(Transform):
-    """Stack multiple channels into a single array"""
-
-    def __init__(self, channel_order: List[str] = ["bf", "405"]):
-        self.channel_order = channel_order
-
-    def __call__(self, data):
-        data = deepcopy(data)
-
-        # Collect and stack channels in specified order
-        stacked_planes = []
-        for key in self.channel_order:
-            if key in data.channels:
-                planes = data.channels[key]
-                # Add each plane as a channel
-                for plane in planes:
-                    stacked_planes.append(plane)
-            else:
-                raise ValueError(f"Channel {key} not found in cell data")
-        if stacked_planes:
-            # Stack into (C, H, W) array
-            data.channels = {"stacked": np.array(stacked_planes)}
-
-        return data
-
-    def get_config(self) -> Dict[str, Any]:
-        return {"type": "StackChannelsTransform", "channel_order": self.channel_order}
 
 
 class TransformPipeline(Transform):

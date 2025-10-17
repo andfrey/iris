@@ -64,34 +64,6 @@ class FeatureExtractor:
 
         return features
 
-    def extract_channel_statistics(
-        self, image: np.ndarray, mask: np.ndarray, channel: str
-    ) -> Dict:
-        """Extrahiert Kanalstatistiken."""
-
-        masked_pixels = image[mask > 0]
-        outside_pixels = image[mask == 0]
-        stats = {}
-
-        if masked_pixels.size > 0:
-            stats[f"mean_intensity_in_mask_{channel}"] = np.mean(
-                masked_pixels
-            ) - np.mean(outside_pixels)
-            stats[f"median_intensity_in_mask_{channel}"] = np.median(
-                masked_pixels
-            ) - np.median(outside_pixels)
-            stats[f"std_intensity_in_mask_{channel}"] = np.std(masked_pixels)
-            stats[f"min_intensity_in_mask_{channel}"] = np.min(masked_pixels)
-            stats[f"max_intensity_in_mask_{channel}"] = np.max(masked_pixels)
-        else:
-            stats[f"mean_intensity_in_mask_{channel}"] = 0
-            stats[f"median_intensity_in_mask_{channel}"] = 0
-            stats[f"std_intensity_in_mask_{channel}"] = 0
-            stats[f"min_intensity_in_mask_{channel}"] = 0
-            stats[f"max_intensity_in_mask_{channel}"] = 0
-
-        return stats
-
     def extract_all_features(self, cell_data: Dict, cell_name: str) -> Dict:
         """Extrahiert alle Features für eine Zelle."""
         features = {"cell_name": cell_name}
@@ -133,12 +105,6 @@ class FeatureExtractor:
                 nucleus_image, seg_mask, "405"
             )
             features.update(intensity_features)
-
-            # Kanalstatistiken
-            red_stats = self.extract_channel_statistics(red_image, seg_mask, "561")
-            green_stats = self.extract_channel_statistics(green_image, seg_mask, "488")
-            features.update(red_stats)
-            features.update(green_stats)
 
         except Exception as e:
             print(f"Fehler beim Extrahieren der Features für {cell_name}:")
