@@ -2,6 +2,33 @@
 
 Comprehensive guide for the modular data pipeline and CLI-based training workflow for cell cycle analysis.
 
+## Setup
+```bash
+# 1. Clone the repository
+git clone <repository-url>
+cd iris
+
+# 2. Create conda environment with Python 3.10
+conda create -n iris_env python=3.10
+conda activate iris_env
+
+# 3. Install Poetry (if not already installed)
+pip install poetry
+
+# 4. Install project dependencies with Poetry
+poetry install
+
+# 5. Verify installation
+python -c "import torch; import lightning; print('Setup successful!')"
+```
+
+**Alternative: Install from requirements.txt**
+
+```bash
+conda activate iris_env
+pip install -r requirements.txt
+```
+
 ## Table of Contents
 
 1. [Overview](#overview)
