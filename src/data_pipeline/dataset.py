@@ -90,7 +90,7 @@ class ModularCellDataModule(L.LightningDataModule):
         self.h5_path = self.config.get("h5_path", None)
         self.batch_size = self.config.get("batch_size", 64)
         self.num_workers = self.config.get("num_workers", 0)
-        self.train_val_split = self.config.get("train_val_split", [0.8, 0.2])
+        self.data_split = self.config.get("data_split", [0.7, 0.2, 0.1])
         self.seed = self.config.get("seed", 42)  # For reproducibility
 
         # Filter parameters
@@ -188,24 +188,13 @@ class ModularCellDataModule(L.LightningDataModule):
 
         # 5. Split into train/val
         if stage == "fit" or stage is None:
-            print(f"\n5. Splitting dataset: {self.train_val_split}")
+            print(f"\n5. Splitting dataset: {self.data_split}")
 
-            # Calculate split sizes
-            total_size = len(self.full_dataset)
-            train_size = int(total_size * self.train_val_split[0])
-            val_size = np.ceil((total_size - train_size) / 2).astype(int)
-            test_size = (
-                total_size - val_size - train_size
-            )  # Adjust train size to use all samples
-
-            assert (
-                sum([train_size, val_size, test_size]) == total_size
-            ), "Train/val/test sizes do not sum to total"
             # Split with generator for reproducibility
             generator = torch.Generator().manual_seed(self.seed)
             self.train_dataset, self.val_dataset, self.test_dataset = random_split(
-                self.full_dataset,
-                [train_size, val_size, test_size],
+                dataset=self.full_dataset,
+                lengths=self.data_split,
                 generator=generator,
             )
 
