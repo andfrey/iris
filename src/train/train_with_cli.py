@@ -50,7 +50,9 @@ print(f"✓ Set float32 matmul precision to: {matmul_precision}")
 # Add parent directory to path to import from models and src
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from models.cnet import CNet
+from src.models.cnet import CNet
+
+# from models.convnextv2 import ConvNeXtV2
 from src.data_pipeline.dataset import ModularCellDataModule
 
 
@@ -60,7 +62,6 @@ def cli_main():
     """
     # Create CLI with custom configuration
     cli = LightningCLI(
-        model_class=CNet,
         datamodule_class=ModularCellDataModule,
         seed_everything_default=42,
         save_config_callback=None,  # Disable automatic config saving
