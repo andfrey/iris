@@ -1,10 +1,5 @@
 # Datendateien (werden automatisch generiert)
-data/iris_processed.csv
-data/train_data.csv
-data/test_data.csv
-
-# Modelle
-models/*.pkl
+data/*
 
 # Notebook Checkpoints
 notebooks/.ipynb_checkpoints/
@@ -50,4 +45,5 @@ Thumbs.db
 .ipynb_checkpoints
 
 # Logs
-*.log
+logs/*
+*mlruns/*

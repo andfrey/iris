@@ -1,6 +1,5 @@
 """
-CNet - Convolutional Neural Network for Cell Image Classification
-Implemented using PyTorch Lightning
+CNet - Convolutional Neural Network for Cell Image FUCCI Intensity Regression
 """
 
 import torch
@@ -9,9 +8,7 @@ import torch.nn.functional as F
 import lightning as L
 from torch.optim import Adam, AdamW, SGD
 from torch.optim.lr_scheduler import ReduceLROnPlateau, CosineAnnealingLR, StepLR
-from torchmetrics import Accuracy, Precision, Recall, F1Score, ConfusionMatrix
 from typing import Optional, Dict, Any, List, Tuple
-import numpy as np
 
 
 class ConvBlock(nn.Module):
@@ -45,17 +42,11 @@ class ConvBlock(nn.Module):
 
 class CNet(L.LightningModule):
     """
-    CNet - Convolutional Neural Network for cell image classification.
-
-    Architecture:
-    - Multiple convolutional blocks with pooling
-    - Fully connected layers
-    - Supports multi-class classification
-    - Built with PyTorch Lightning for easy training
+    CNet - Convolutional Neural Network for FUCCI intensity regression based on cell images.
 
     Args:
         in_channels: Number of input channels
-        num_classes: Number of output classes
+        output_dim: Dimension of output (e.g., 2 for 2D regression)
         base_filters: Number of filters in first conv layer (doubles each block)
         num_blocks: Number of convolutional blocks
         fc_hidden_dims: List of hidden layer dimensions for FC layers
@@ -215,7 +206,8 @@ class CNet(L.LightningModule):
         # Select optimizer
         if self.optimizer_name.lower() == "adam":
             optimizer = Adam(
-                self.parameters(), lr=self.learning_rate,
+                self.parameters(),
+                lr=self.learning_rate,
             )
         elif self.optimizer_name.lower() == "adamw":
             optimizer = AdamW(
@@ -235,9 +227,7 @@ class CNet(L.LightningModule):
         if self.scheduler_name is None:
             return optimizer
         if self.scheduler_name.lower() == "plateau":
-            scheduler = ReduceLROnPlateau(
-                optimizer, min_lr=1e-6
-            )
+            scheduler = ReduceLROnPlateau(optimizer, min_lr=1e-6)
             return {
                 "optimizer": optimizer,
                 "lr_scheduler": {
@@ -259,86 +249,3 @@ class CNet(L.LightningModule):
         # Log learning rate
         current_lr = self.trainer.optimizers[0].param_groups[0]["lr"]
         self.log("learning_rate", current_lr, prog_bar=False)
-
-
-class CNetDeep(CNet):
-    """
-    Deeper variant of CNet with residual connections.
-
-    Uses residual blocks for better gradient flow in deeper networks.
-    """
-
-    def __init__(self, *args, **kwargs):
-        # Modify default parameters for deeper network
-        kwargs.setdefault("num_blocks", 5)
-        kwargs.setdefault("base_filters", 64)
-        kwargs.setdefault("fc_hidden_dims", [1024, 512, 256])
-        kwargs.setdefault("task", "regression")
-
-        super().__init__(*args, **kwargs)
-
-        # Replace conv blocks with residual blocks
-        self.conv_blocks = nn.ModuleList()
-        current_channels = self.in_channels
-        base_filters = self.hparams.base_filters
-        num_blocks = self.hparams.num_blocks
-        dropout = self.hparams.dropout
-        use_batchnorm = self.hparams.use_batchnorm
-
-        for i in range(num_blocks):
-            out_channels = base_filters * (2**i)
-            self.conv_blocks.append(
-                ResidualBlock(
-                    current_channels,
-                    out_channels,
-                    dropout=dropout,
-                    use_batchnorm=use_batchnorm,
-                )
-            )
-            current_channels = out_channels
-
-
-class ResidualBlock(nn.Module):
-    """
-    Residual block with skip connection.
-    """
-
-    def __init__(
-        self,
-        in_channels: int,
-        out_channels: int,
-        dropout: float = 0.1,
-        use_batchnorm: bool = True,
-    ):
-        super().__init__()
-
-        self.conv1 = ConvBlock(
-            in_channels, out_channels, dropout=dropout, use_batchnorm=use_batchnorm
-        )
-        self.conv2 = ConvBlock(
-            out_channels, out_channels, dropout=dropout, use_batchnorm=use_batchnorm
-        )
-        self.pool = nn.MaxPool2d(2, 2)
-
-        # Skip connection
-        if in_channels != out_channels:
-            self.skip = nn.Sequential(
-                nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=1),
-                nn.BatchNorm2d(out_channels) if use_batchnorm else nn.Identity(),
-            )
-        else:
-            self.skip = nn.Identity()
-
-    def forward(self, x):
-        identity = self.skip(x)
-
-        out = self.conv1(x)
-        out = self.conv2(out)
-
-        out = out + identity
-        out = self.pool(out)
-
-        return out
-
-
-

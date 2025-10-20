@@ -1,27 +1,4 @@
 #!/usr/bin/env python
-"""
-Training script using PyTorch Lightning CLI.
-
-This script uses Lightning CLI for flexible command-line training with automatic
-argument parsing from both command line and config files.
-
-Note: The simplified CellDataModule requires a dataset instance to be passed in.
-      You need to create the H5CellDataset with transforms before creating the datamodule.
-
-Usage examples:
-
-1. Using Python script (recommended with simplified CellDataModule):
-   See train_simple.py for a complete example
-
-2. Using a config file (requires manual dataset creation):
-   python train_model.py fit --config config.yaml
-
-3. Direct training with model and data:
-   # Create dataset first, then pass to datamodule
-   from src.data_processing import H5CellDataset, CellImageTransform, FUCCIRepresentationTransform
-   dataset = H5CellDataset(h5_file='path/to/data.h5', transform=..., target_transform=...)
-   # Then use CLI or create datamodule manually
-"""
 
 import sys
 from pathlib import Path
