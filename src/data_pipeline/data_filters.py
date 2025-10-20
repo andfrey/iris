@@ -78,11 +78,13 @@ class PlaneCountFilter(CellFilter):
 
 class MultipleObjectsFilter(CellFilter):
     """Filter cells with multiple objects in segmentation mask"""
+
     object_class_mask_map = {
         "cell": "segmentation",
         "nuclei": "nuclei_segmentation",
     }
-    def __init__(self, max_objects: int = 1, object_class: List[str] = ["cell", "nuclei"]):
+
+    def __init__(self, max_objects: int = 1, object_class: List[str] = ["cell"]):
         self.max_objects = max_objects
         self.object_masks = [self.object_class_mask_map[cls] for cls in object_class]
 
@@ -118,7 +120,12 @@ class MultipleObjectsFilter(CellFilter):
 class EmptySegmentationFilter(CellFilter):
     """Filter cells where segmentation failed (empty mask)"""
 
-    def __init__(self, min_pixels: int = 10, segmentations: List[str] = ["segmentation", "nuclei_segmentation"], planes_missing: str = "middle"):
+    def __init__(
+        self,
+        min_pixels: int = 10,
+        segmentations: List[str] = ["segmentation", "nuclei_segmentation"],
+        planes_missing: str = "middle",
+    ):
         self.min_pixels = min_pixels
         self.segmentations = segmentations
         self.planes_missing = planes_missing
@@ -127,36 +134,41 @@ class EmptySegmentationFilter(CellFilter):
         for segmentation_attr in self.segmentations:
             if not getattr(cell_data, segmentation_attr):
                 return FilterResult(is_valid=False, reason="missing_segmentation")
-            
+
             for i, seg in enumerate(getattr(cell_data, segmentation_attr)):
                 if self.planes_missing == "first" and i != 0:
                     continue
-                if self.planes_missing == "last" and i != len(getattr(cell_data, segmentation_attr)) - 1:
+                if (
+                    self.planes_missing == "last"
+                    and i != len(getattr(cell_data, segmentation_attr)) - 1
+                ):
                     continue
-                if self.planes_missing == "middle" and (i != len(getattr(cell_data, segmentation_attr)) // 2):
+                if self.planes_missing == "middle" and (
+                    i != len(getattr(cell_data, segmentation_attr)) // 2
+                ):
                     continue
-                    
+
                 num_pixels = np.sum(seg > 0)
-                
+
                 if num_pixels < self.min_pixels:
                     return FilterResult(
                         is_valid=False,
-                        reason="failed_segmentation",
+                        reason=f"failed_segmentation_{segmentation_attr}",
                         metadata={"num_pixels": int(num_pixels)},
                     )
-            
+
         return FilterResult(is_valid=True)
 
     def get_name(self) -> str:
         return f"EmptySegmentation(min_pixels={self.min_pixels}, segmentations={self.segmentations}, planes_missing={self.planes_missing})"
 
 
-class NucleiSizeFilter(CellFilter):
+class CellNucleiOverlappingFilter(CellFilter):
     """Filter cells where mask of the nucleus is larger than a threshold ratio of the cell mask
     indicating a likely segmentation error.
     """
 
-    def __init__(self, max_ratio: float = 1.2):
+    def __init__(self, max_ratio: float = 0.2):
         self.max_ratio = max_ratio
 
     def __call__(self, cell_data) -> FilterResult:
@@ -167,32 +179,33 @@ class NucleiSizeFilter(CellFilter):
             # If no nuclei segmentation, can't apply this filter
             return FilterResult(is_valid=True)
 
-        # Get first plane if it's a list
+        # Get middle plane if it's a list
         seg = (
-            cell_data.segmentation[0]
+            cell_data.segmentation[len(cell_data.segmentation) // 2]
             if isinstance(cell_data.segmentation, list)
             else cell_data.segmentation
         )
         nuclei_seg = (
-            cell_data.nuclei_segmentation[0]
+            cell_data.nuclei_segmentation[len(cell_data.nuclei_segmentation) // 2]
             if isinstance(cell_data.nuclei_segmentation, list)
             else cell_data.nuclei_segmentation
         )
 
         cell_area = np.sum(seg > 0)
-        nuclei_area = np.sum(nuclei_seg > 0)
+        nuclei_outside_cell = ((nuclei_seg > 0) & (seg == 0)).astype(int)
+        nuclei_area_outside_cell = np.sum(nuclei_outside_cell)
 
         if cell_area == 0:
             return FilterResult(is_valid=False, reason="zero_cell_area")
 
-        ratio = nuclei_area / cell_area
+        ratio = nuclei_area_outside_cell / cell_area
 
         if ratio > self.max_ratio:
             return FilterResult(
                 is_valid=False,
                 reason="nuclei_too_large",
                 metadata={
-                    "nuclei_area": int(nuclei_area),
+                    "nuclei_area_outside_cell": int(nuclei_area_outside_cell),
                     "cell_area": int(cell_area),
                     "ratio": float(ratio),
                     "max_ratio": self.max_ratio,
@@ -202,7 +215,7 @@ class NucleiSizeFilter(CellFilter):
         return FilterResult(is_valid=True)
 
     def get_name(self) -> str:
-        return f"NucleiSize(max_ratio={self.max_ratio})"
+        return f"NucleCellNucleiOverlappingFilteriSize(max_ratio={self.max_ratio})"
 
 
 class CompositeFilter:

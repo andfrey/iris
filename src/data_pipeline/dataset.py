@@ -18,7 +18,7 @@ from .data_filters import (
     PlaneCountFilter,
     EmptySegmentationFilter,
     MultipleObjectsFilter,
-    NucleiSizeFilter,
+    CellNucleiOverlappingFilter,
 )
 
 
@@ -154,14 +154,13 @@ class ModularCellDataModule(L.LightningDataModule):
                 PlaneCountFilter(expected_planes=self.plane_count),
                 EmptySegmentationFilter(min_pixels=self.min_seg_pixels),
                 MultipleObjectsFilter(max_objects=self.max_objects),
-                NucleiSizeFilter(max_ratio=self.max_nuclei_ratio),
+                CellNucleiOverlappingFilter(max_ratio=self.max_nuclei_ratio),
             ]
 
             filtered_source = FilteredDataSource(
                 data_source=data_source,
                 filters=filters,
                 cache_results=True,
-                show_progress=True,
                 force_refilter=self.force_refilter,
             )
 
@@ -264,7 +263,7 @@ class ModularCellDataset(Dataset):
         self,
         data_source: DataSource,
         transform: Optional[Transform] = None,
-        mask_intensity: str = "segment",
+        mask_intensity: str = "segmentation",
         debug: bool = False,
     ):
         """
@@ -335,7 +334,9 @@ def compute_fucci_labels(
     """
     labels = []
     if mask_intensity not in ["segmentation", "nuclei_segmentation"]:
-        raise ValueError("mask_intensity must be 'segmentation' or 'nuclei_segmentation'")
+        raise ValueError(
+            f"mask_intensity must be 'segmentation' or 'nuclei_segmentation' got {mask_intensity}"
+        )
     # Only compute mean intensity within the mask_intensity region
     if not hasattr(cell_data, mask_intensity):
         # No mask available, fall back to computing over entire image

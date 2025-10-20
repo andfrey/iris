@@ -59,77 +59,94 @@ class ChannelTransform(Transform):
 class CropTransform(Transform):
     """Crop image to bounding box of segmentation mask"""
 
-    def __init__(
-        self,
-        padding: int = 0,
-        dimension: int = 250
-    ):
+    def __init__(self, padding: int = 0, dimension: int = 250):
         """
         Args:
             padding: Additional pixels to include around the mask bounding box
         """
         self.padding = padding
+        self.dimension = dimension
 
     def __call__(self, data):
         data = deepcopy(data)
 
         # Get the segmentation mask to use
-        mask = data.segmentation
+        masks = data.segmentation
 
-        if mask is None:
-            return data
+        if not isinstance(masks, list):
+            raise TypeError("Expected list of planes for segmentation mask")
+        rmins = []
+        rmaxs = []
+        cmins = []
+        cmaxs = []
+        for plane_mask in masks:
 
-        # Handle list of planes
-        if isinstance(mask, list):
-            mask = mask[len(mask) // 2]  # Use middle plane for bounding box
+            # If mask is empty, skip
+            if np.sum(plane_mask) < 10:
+                continue
+            # Find bounding box of non-zero regions
+            rows = np.any(plane_mask, axis=1)
+            cols = np.any(plane_mask, axis=0)
 
-        # Find bounding box of non-zero regions
-        rows = np.any(mask, axis=1)
-        cols = np.any(mask, axis=0)
+            if not rows.any() or not cols.any():
+                # Empty mask, return original data
+                return data
 
-        if not rows.any() or not cols.any():
-            # Empty mask, return original data
-            return data
+            rmin, rmax = np.where(rows)[0][[0, -1]]
+            cmin, cmax = np.where(cols)[0][[0, -1]]
 
-        rmin, rmax = np.where(rows)[0][[0, -1]]
-        cmin, cmax = np.where(cols)[0][[0, -1]]
-        
-        crop_dim = max(rmax - rmin, cmax - cmin)
-        
-        padding_r = (crop_dim - (rmax - rmin)) // 2 + self.padding
-        padding_c = (crop_dim - (cmax - cmin)) // 2 + self.padding
-        
-        # Add padding
-        h, w = mask.shape
-        rmin = max(0, rmin - self.padding)
-        rmax = min(h, rmax + self.padding + 1)
-        cmin = max(0, cmin - self.padding)
-        cmax = min(w, cmax + self.padding + 1)
+            crop_dim = max(rmax - rmin, cmax - cmin)
+
+            padding_r = (crop_dim - (rmax - rmin)) // 2 + self.padding
+            padding_c = (crop_dim - (cmax - cmin)) // 2 + self.padding
+
+            # Add padding
+            h, w = plane_mask.shape
+            rmins.append(max(0, rmin - padding_r))
+            rmaxs.append(min(h, rmax + padding_r + 1))
+            cmins.append(max(0, cmin - padding_c))
+            cmaxs.append(min(w, cmax + padding_c + 1))
+
+        rmin = min(rmins)
+        rmax = max(rmaxs)
+        cmin = min(cmins)
+        cmax = max(cmaxs)
 
         # Crop all channels
         for key in data.channels:
             planes = data.channels[key]
             if isinstance(planes, list):
-                data.channels[key] = [self._fit_to_dimension(plane[rmin:rmax, cmin:cmax]) for plane in planes]
+                data.channels[key] = [
+                    self._fit_to_dimension(plane[rmin:rmax, cmin:cmax])
+                    for plane in planes
+                ]
             else:
-                data.channels[key] = [self._fit_to_dimension(planes[rmin:rmax, cmin:cmax])]
+                data.channels[key] = [
+                    self._fit_to_dimension(planes[rmin:rmax, cmin:cmax])
+                ]
 
         # Crop segmentation masks
         if data.segmentation is not None:
             if isinstance(data.segmentation, list):
                 data.segmentation = [
-                    self._fit_to_dimension(plane[rmin:rmax, cmin:cmax]) for plane in data.segmentation
+                    self._fit_to_dimension(plane[rmin:rmax, cmin:cmax])
+                    for plane in data.segmentation
                 ]
             else:
-                data.segmentation = self._fit_to_dimension(data.segmentation[rmin:rmax, cmin:cmax])
+                data.segmentation = self._fit_to_dimension(
+                    data.segmentation[rmin:rmax, cmin:cmax]
+                )
 
         if data.nuclei_segmentation is not None:
             if isinstance(data.nuclei_segmentation, list):
                 data.nuclei_segmentation = [
-                    self._fit_to_dimension(plane[rmin:rmax, cmin:cmax]) for plane in data.nuclei_segmentation
+                    self._fit_to_dimension(plane[rmin:rmax, cmin:cmax])
+                    for plane in data.nuclei_segmentation
                 ]
             else:
-                data.nuclei_segmentation = self._fit_to_dimension(data.nuclei_segmentation[rmin:rmax, cmin:cmax])
+                data.nuclei_segmentation = self._fit_to_dimension(
+                    data.nuclei_segmentation[rmin:rmax, cmin:cmax]
+                )
 
         return data
 
@@ -137,13 +154,16 @@ class CropTransform(Transform):
         """Resize or pad image to target dimension"""
         image_dim = image.shape[0]
         target_dim = self.dimension
-    
+
         # Crop if larger than target
         if image_dim > target_dim:
-            image = cv2.resize(image, (target_dim, target_dim), interpolation=cv2.INTER_AREA)
+            image = cv2.resize(
+                image, (target_dim, target_dim), interpolation=cv2.INTER_AREA
+            )
         else:
-            image = cv2.resize(image, (target_dim, target_dim), interpolation=cv2.INTER_CUBIC)
-        
+            image = cv2.resize(
+                image, (target_dim, target_dim), interpolation=cv2.INTER_CUBIC
+            )
 
         # Pad if smaller than target
         h, w = image.shape
@@ -163,7 +183,7 @@ class CropTransform(Transform):
             )
 
         return image
-    
+
     def get_config(self) -> Dict[str, Any]:
         return {
             "type": "CropTransform",
