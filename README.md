@@ -16,18 +16,16 @@ conda activate iris_env
 pip install poetry
 
 # 4. Install project dependencies with Poetry
-poetry install
+poetry install --with dev
 
 # 5. Verify installation
 python -c "import torch; import lightning; print('Setup successful!')"
+
+# 6. Install pre-commit
+pre-commit install
+pre-commit run --all-files
 ```
 
-**Alternative: Install from requirements.txt**
-
-```bash
-conda activate iris_env
-pip install -r requirements.txt
-```
 
 ## Table of Contents
 
@@ -236,7 +234,7 @@ from src.data_pipeline.dataset import ModularCellDataModule, show_images
 
 # Create datamodule
 data_module = ModularCellDataModule(
-    "configs/data_config.yaml" 
+    "configs/data_config.yaml"
 )
 
 data_module.setup()
