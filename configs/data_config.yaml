@@ -1,27 +1,25 @@
 # Data source
-  h5_path: /data/fucci_3t3_221124_filtered_noNG030JP208_with_nuclei_seg.h5
-  
+  h5_path: /myhome/iris/data/fucci_3t3_221124_filtered_noNG030JP208_with_nuclei_seg.h5
+
   # DataLoader settings
   batch_size: 64
   num_workers: 0  # Use 0 for A100 to avoid shared memory issues
-  
+
   # Train/val split
   data_split: [0.7, 0.2, 0.1]  # Train, Val, Test splits
   seed: 42
-  
+
   # Quality filters
   use_quality_filters: true
   plane_count: 3
   max_objects: 1
   min_seg_pixels: 10
-  max_nuclei_ratio: 0.2
+  max_nuclei_outside_ratio: 0.2
   force_refilter: false  # Use cached results if available
-  
+
   # Preprocessing transforms
   transforms:
-    # 1. Normalize BEFORE stacking (while channels still have their names)
     - class_path: src.data_pipeline.data_transforms.NormalizeTransform
       init_args:
         method: standardize  # Changed to standardize for zero mean and unit variance
         channel_keys: ['405', 'bf']
-    
