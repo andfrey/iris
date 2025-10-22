@@ -47,9 +47,7 @@ class TestComputeFucciLabels:
         radius = int(np.sqrt(mask_fraction * H * W / np.pi))
 
         y, x = np.ogrid[:H, :W]
-        mask_single = ((y - center_y) ** 2 + (x - center_x) ** 2 <= radius**2).astype(
-            np.uint8
-        )
+        mask_single = ((y - center_y) ** 2 + (x - center_x) ** 2 <= radius**2).astype(np.uint8)
 
         # Create channels with known intensities
         for channel, intensity in [("488", intensity_488), ("561", intensity_561)]:
@@ -68,12 +66,8 @@ class TestComputeFucciLabels:
             segmentation.append(mask_single.copy())
 
         # Add other required channels (optional)
-        channels["405"] = [
-            np.zeros(image_size, dtype=np.float32) for _ in range(num_planes)
-        ]
-        channels["bf"] = [
-            np.ones(image_size, dtype=np.float32) * 50 for _ in range(num_planes)
-        ]
+        channels["405"] = [np.zeros(image_size, dtype=np.float32) for _ in range(num_planes)]
+        channels["bf"] = [np.ones(image_size, dtype=np.float32) * 50 for _ in range(num_planes)]
 
         return CellData(
             cell_id="test_cell",
@@ -93,22 +87,31 @@ class TestComputeFucciLabels:
         )
 
         # Compute labels
-        labels = compute_fucci_labels(cell_data)
-
+        labels_log = compute_fucci_labels(cell_data, log_transform=True)
+        labels = compute_fucci_labels(cell_data, log_transform=False)
         # Check output shape
         assert labels.shape == (2,), f"Expected shape (2,), got {labels.shape}"
         assert labels.dtype == np.float32, f"Expected dtype float32, got {labels.dtype}"
+        assert labels_log.shape == (2,), f"Expected shape (2,), got {labels_log.shape}"
+        assert labels_log.dtype == np.float32, f"Expected dtype float32, got {labels_log.dtype}"
 
         # Check that values are log-transformed (should be positive)
-        assert labels[0] > 0, "488 label should be positive (log-transformed)"
-        assert labels[1] > 0, "561 label should be positive (log-transformed)"
+        assert labels[0] > 0, "488 label should be positive"
+        assert labels[1] > 0, "561 label should be positive"
+        assert labels_log[0] > 0, "488 label should be positive (log-transformed)"
+        assert labels_log[1] > 0, "561 label should be positive (log-transformed)"
 
         # Check relative ordering (561 should be higher)
         # After background subtraction: 488 has ~90, 561 has ~190
         # log(190) > log(90)
         assert labels[1] > labels[0], "561 intensity should be higher than 488"
-        assert labels[0] == np.log(np.float32(100.0))
-        assert labels[1] == np.log(np.float32(200.0))
+        assert (
+            labels_log[1] > labels_log[0]
+        ), "561 intensity should be higher than 488 (log-transformed)"
+        assert np.isclose(labels[0], np.float32(100.0))
+        assert np.isclose(labels[1], np.float32(200.0))
+        assert labels_log[0] == np.log(np.float32(100.0))
+        assert labels_log[1] == np.log(np.float32(200.0))
 
     def test_background_subtraction(self):
         """Test that background is properly subtracted."""
@@ -203,9 +206,7 @@ class TestComputeFucciLabels:
             "488": [np.ones((250, 250), dtype=np.float32) * 100 for _ in range(3)],
             "561": [np.ones((250, 250), dtype=np.float32) * 200 for _ in range(3)],
         }
-        segmentation = [
-            np.ones((250, 250), dtype=np.uint8) for _ in range(2)
-        ]  # Only 2 masks!
+        segmentation = [np.ones((250, 250), dtype=np.uint8) for _ in range(2)]  # Only 2 masks!
 
         cell_data = CellData(
             cell_id="test_cell",
@@ -215,9 +216,7 @@ class TestComputeFucciLabels:
         )
 
         # Should raise ValueError
-        with pytest.raises(
-            ValueError, match="planes and segmentation planes count mismatch"
-        ):
+        with pytest.raises(ValueError, match="planes and segmentation planes count mismatch"):
             compute_fucci_labels(cell_data)
 
     def test_empty_mask(self):
@@ -227,9 +226,7 @@ class TestComputeFucciLabels:
             "488": [np.ones((250, 250), dtype=np.float32) * 100 for _ in range(3)],
             "561": [np.ones((250, 250), dtype=np.float32) * 200 for _ in range(3)],
         }
-        segmentation = [
-            np.zeros((250, 250), dtype=np.uint8) for _ in range(3)
-        ]  # Empty masks!
+        segmentation = [np.zeros((250, 250), dtype=np.uint8) for _ in range(3)]  # Empty masks!
 
         cell_data = CellData(
             cell_id="test_cell",
@@ -323,9 +320,7 @@ class TestComputeFucciLabels:
         labels = compute_fucci_labels(cell_data)
 
         # Should not crash and return finite values
-        assert np.isfinite(
-            labels
-        ).all(), "Should return finite values even with negative signals"
+        assert np.isfinite(labels).all(), "Should return finite values even with negative signals"
 
 
 class TestModularCellDataset:

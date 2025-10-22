@@ -42,18 +42,46 @@ class ChannelTransform(Transform):
                 planes = data.channels[key]
                 # Transform each plane
                 if isinstance(planes, list):
-                    data.channels[key] = [
-                        self.transform_image(plane) for plane in planes
-                    ]
+                    data.channels[key] = [self.transform_image(plane, key) for plane in planes]
                 else:
-                    data.channels[key] = [self.transform_image(planes)]
+                    data.channels[key] = [self.transform_image(planes, key)]
 
         return data
 
     @abstractmethod
-    def transform_image(self, image: np.ndarray) -> np.ndarray:
+    def transform_image(self, image: np.ndarray, channel_key: str) -> np.ndarray:
         """Transform a single 2D image"""
         pass
+
+
+class FUCCIScaleTransform(ChannelTransform):
+    """Scale FUCCI channel intensities based on predefined factors"""
+
+    def __init__(
+        self,
+        channel_keys: Optional[List[str]] = ["488", "561"],
+        scale_divider_488: float = 18_000,
+        scale_divider_561: float = 40_000,
+    ):
+        super().__init__(channel_keys)
+        self.scale_factors = {
+            "488": 1.0 / scale_divider_488,
+            "561": 1.0 / scale_divider_561,
+        }
+
+    def transform_image(self, image: np.ndarray, channel_key: str) -> np.ndarray:
+        scale_factor = self.scale_factors.get(channel_key)
+        if scale_factor is None:
+            raise ValueError(f"No scale factor defined for channel {channel_key}")
+
+        return image * scale_factor
+
+    def get_config(self) -> Dict[str, Any]:
+        return {
+            "type": "FUCCIScaleTransform",
+            "channel_keys": self.channel_keys,
+            "scale_factors": self.scale_factors,
+        }
 
 
 class CropTransform(Transform):
@@ -80,7 +108,6 @@ class CropTransform(Transform):
         cmins = []
         cmaxs = []
         for plane_mask in masks:
-
             # If mask is empty, skip
             if np.sum(plane_mask) < 10:
                 continue
@@ -117,13 +144,10 @@ class CropTransform(Transform):
             planes = data.channels[key]
             if isinstance(planes, list):
                 data.channels[key] = [
-                    self._fit_to_dimension(plane[rmin:rmax, cmin:cmax])
-                    for plane in planes
+                    self._fit_to_dimension(plane[rmin:rmax, cmin:cmax]) for plane in planes
                 ]
             else:
-                data.channels[key] = [
-                    self._fit_to_dimension(planes[rmin:rmax, cmin:cmax])
-                ]
+                data.channels[key] = [self._fit_to_dimension(planes[rmin:rmax, cmin:cmax])]
 
         # Crop segmentation masks
         if data.segmentation is not None:
@@ -133,9 +157,7 @@ class CropTransform(Transform):
                     for plane in data.segmentation
                 ]
             else:
-                data.segmentation = self._fit_to_dimension(
-                    data.segmentation[rmin:rmax, cmin:cmax]
-                )
+                data.segmentation = self._fit_to_dimension(data.segmentation[rmin:rmax, cmin:cmax])
 
         if data.nuclei_segmentation is not None:
             if isinstance(data.nuclei_segmentation, list):
@@ -157,13 +179,9 @@ class CropTransform(Transform):
 
         # Crop if larger than target
         if image_dim > target_dim:
-            image = cv2.resize(
-                image, (target_dim, target_dim), interpolation=cv2.INTER_AREA
-            )
+            image = cv2.resize(image, (target_dim, target_dim), interpolation=cv2.INTER_AREA)
         else:
-            image = cv2.resize(
-                image, (target_dim, target_dim), interpolation=cv2.INTER_CUBIC
-            )
+            image = cv2.resize(image, (target_dim, target_dim), interpolation=cv2.INTER_CUBIC)
 
         # Pad if smaller than target
         h, w = image.shape
@@ -203,8 +221,7 @@ class NormalizeTransform(ChannelTransform):
         super().__init__(channel_keys)
         self.method = method
 
-    def transform_image(self, image: np.ndarray) -> np.ndarray:
-
+    def transform_image(self, image: np.ndarray, channel_key: str) -> np.ndarray:
         if self.method == "minmax":
             min_val = image.min()
             max_val = image.max()
@@ -241,7 +258,7 @@ class GaussianFilterTransform(ChannelTransform):
         super().__init__(channel_keys)
         self.sigma = sigma
 
-    def transform_image(self, image: np.ndarray) -> np.ndarray:
+    def transform_image(self, image: np.ndarray, channel_key: str) -> np.ndarray:
         return ndimage.gaussian_filter(image, sigma=self.sigma)
 
     def get_config(self) -> Dict[str, Any]:
@@ -295,9 +312,7 @@ class SelectPlanesTransform(Transform):
             elif self.plane_selection == "last":
                 data.segmentation = [planes[-1]]
 
-        if data.nuclei_segmentation is not None and isinstance(
-            data.nuclei_segmentation, list
-        ):
+        if data.nuclei_segmentation is not None and isinstance(data.nuclei_segmentation, list):
             planes = data.nuclei_segmentation
             if self.plane_selection == "middle":
                 data.nuclei_segmentation = [planes[len(planes) // 2]]
@@ -333,7 +348,7 @@ class RollingBallTransform(ChannelTransform):
         super().__init__(channel_keys)
         self.radius = radius
 
-    def transform_image(self, image: np.ndarray) -> np.ndarray:
+    def transform_image(self, image: np.ndarray, channel_key: str) -> np.ndarray:
         # Estimate background
         background = rolling_ball(image, radius=self.radius)
 

@@ -321,7 +321,10 @@ class ModularCellDataset(Dataset):
 
 
 def compute_fucci_labels(
-    cell_data: CellData, mask_intensity: str = "segmentation", debug: bool = False
+    cell_data: CellData,
+    mask_intensity: str = "segmentation",
+    log_transform: bool = False,
+    debug: bool = False,
 ) -> np.ndarray:
     """
     Compute FUCCI mean log intensities (488 and 561) from cell data within the specified mask.
@@ -373,10 +376,12 @@ def compute_fucci_labels(
             assert mean_intensity <= max(
                 [plane.max() for plane in planes]
             ), "Mean intensity exceeds max plane intensity"
-            log_mean_intensity = (
-                np.log(mean_intensity) if mean_intensity > 0.0 else 0.0
-            )  # Log normalization
-            labels.append(log_mean_intensity)
+            if log_transform:
+                mean_intensity = (
+                    np.log(mean_intensity) if mean_intensity > 0.0 else 0.0
+                )  # Log normalization
+
+            labels.append(mean_intensity)
         else:
             raise ValueError(f"Channel {channel} not found in cell data")
 
