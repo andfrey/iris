@@ -54,6 +54,80 @@ class ChannelTransform(Transform):
         pass
 
 
+class RemoveBackgroundTransform(Transform):
+    """Remove background using morphological opening"""
+
+    def __init__(
+        self,
+        channel_keys: Optional[List[str]] = None,
+        background_padding: int = 15,
+        mask: str = "cell",
+    ):
+        self.channel_keys = channel_keys
+        self.background_padding = background_padding
+        self.mask = mask  # 'cell' or 'nuclei'
+        if mask not in ["cell", "nuclei"]:
+            raise ValueError("mask must be 'cell' or 'nuclei'")
+
+    def __call__(self, data):
+        data = deepcopy(data)
+        channels_to_transform = self.channel_keys or list(data.channels.keys())
+
+        for key in channels_to_transform:
+            if key in data.channels:
+                planes = data.channels[key]
+                masks = data.segmentation if self.mask == "cell" else data.nuclei_segmentation
+                if masks is None:
+                    raise ValueError(
+                        f"No {self.mask} segmentation mask available for background removal"
+                    )
+                # Transform each plane
+                if isinstance(planes, list):
+                    data.channels[key] = self._remove_background(planes, masks)
+                else:
+                    data.channels[key] = self._remove_background([planes], [masks])
+
+        return data
+
+    def _remove_background(
+        self, images: List[np.ndarray], masks: List[np.ndarray]
+    ) -> List[np.ndarray]:
+        # Subtract background
+        for image, mask in zip(images, masks):
+            if np.sum(mask) < 10:
+                mask = masks[
+                    len(masks) // 2
+                ]  # Use middle plane if no mask provided has less than 10 pixels
+                if mask is None:
+                    raise ValueError("No segmentation mask available for background removal")
+            mask_height, mask_width = mask.shape
+            # Pad mask
+            if self.background_padding > 0:
+                mask = cv2.resize(
+                    mask,
+                    (
+                        mask_width + self.background_padding * 2,
+                        mask_height + self.background_padding * 2,
+                    ),
+                    interpolation=cv2.INTER_CUBIC,
+                )
+                mask = mask[
+                    self.background_padding : -self.background_padding,
+                    self.background_padding : -self.background_padding,
+                ]
+            image[mask == 0] = 0.0
+
+        return images
+
+    def get_config(self) -> Dict[str, Any]:
+        return {
+            "type": "RemoveBackgroundTransform",
+            "channel_keys": self.channel_keys,
+            "background_padding": self.background_padding,
+            "mask": self.mask,
+        }
+
+
 class FUCCIScaleTransform(ChannelTransform):
     """Scale FUCCI channel intensities based on predefined factors"""
 

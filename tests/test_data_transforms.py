@@ -15,6 +15,7 @@ from src.data_pipeline.data_transforms import (
     GaussianFilterTransform,
     TransformPipeline,
     FUCCIScaleTransform,
+    RemoveBackgroundTransform,
 )
 from src.data_pipeline.data_sources import CellData
 
@@ -417,6 +418,69 @@ class TestGaussianFilterTransform:
         std_small = result_small.channels["405"][0].std()
         std_large = result_large.channels["405"][0].std()
         assert std_large < std_small
+
+
+def make_image(shape=(10, 12), fill=100.0):
+    return np.full(shape, fill, dtype=float)
+
+
+def make_mask(shape=(10, 12), on_region=(slice(2, 8), slice(3, 9))):
+    m = np.zeros(shape, dtype=np.uint8)
+    m[on_region] = 1
+    return m
+
+
+class DummyData:
+    def __init__(self, channels, segmentation=None, nuclei_segmentation=None):
+        # channels: dict of key -> either single ndarray or list of ndarrays
+        self.channels = channels
+        self.segmentation = segmentation
+        self.nuclei_segmentation = nuclei_segmentation
+
+
+def test_remove_background_multiplane_uses_masks_per_plane():
+    # create two planes and two masks
+    img1 = make_image()
+    img2 = make_image(fill=50.0)
+    mask1 = make_mask()
+    # second mask zeros out everything (should zero-out whole image)
+    mask2 = make_mask(on_region=(slice(1, 2), slice(0, 1)))
+
+    data = DummyData(channels={"488": [img1.copy(), img2.copy()]}, segmentation=[mask1, mask2])
+
+    t = RemoveBackgroundTransform(channel_keys=["488"], background_padding=0, mask="cell")
+    out = t(data)
+
+    # first plane: pixels outside mask1 should be zero
+    out1 = out.channels["488"][0]
+    assert np.all(out1[mask1 == 0] == 0.0)
+    # inside mask should remain unchanged (equal to original)
+    assert np.all(out1[mask1 == 1] == img1[mask1 == 1])
+
+    out2 = out.channels["488"][1]
+    assert np.sum(out2) == 50.0
+
+
+def test_remove_background_single_plane_and_nuclei_mask_option():
+    img = make_image()
+    mask = make_mask()
+
+    data = DummyData(channels={"561": img.copy()}, segmentation=None, nuclei_segmentation=mask)
+
+    t = RemoveBackgroundTransform(channel_keys=["561"], background_padding=1, mask="nuclei")
+    out = t(data)
+
+    out_img = out.channels["561"][0]
+    assert np.all(out_img[mask == 1] == img[mask == 1])
+
+
+def test_remove_background_raises_when_no_masks_available():
+    img = make_image()
+    data = DummyData(channels={"488": [img.copy()]}, segmentation=None, nuclei_segmentation=None)
+
+    t = RemoveBackgroundTransform(channel_keys=["488"], background_padding=0, mask="cell")
+    with pytest.raises(ValueError):
+        t(data)
 
 
 class TestTransformPipeline:
