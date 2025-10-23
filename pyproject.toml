@@ -32,17 +32,6 @@ dependencies = [
     "opencv-python (>=4.12.0.88,<5.0.0.0)",
 ]
 
-[project.optional-dependencies]
-dev = [
-    "pytest>=7.4.0",
-    "pytest-cov>=4.1.0",
-    "jupyter>=1.0.0",
-    "ipykernel>=6.25.0",
-    "black>=23.7.0",
-    "flake8>=6.1.0",
-    "seaborn>=0.13.2",
-]
-
 [project.urls]
 Homepage = "https://github.com/andfrey/iris"
 Repository = "https://github.com/andfrey/iris"
@@ -55,9 +44,43 @@ packages = [".src", ".src.data_pipeline", ".src.train", ".src.models"]
 [tool.setuptools.package-data]
 src = ["py.typed"]
 
+[tool.pytest.ini_options]
+minversion = "7.0"
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "fast: marks tests as fast (select with '-m fast')",
+    "integration: marks tests as integration tests",
+    "unit: marks tests as unit tests",
+]
+addopts = [
+    "-v",
+    "--strict-markers",
+    "--tb=short",
+]
+
+[tool.black]
+line-length = 100
+target-version = ['py310']
+
+[tool.isort]
+profile = "black"
+line_length = 100
+
 [tool.poetry]
 package-mode = false
 [dependency-groups]
 dev = [
-    "seaborn (>=0.13.2,<0.14.0)"
+    "seaborn (>=0.13.2,<0.14.0)",
+    "pytest>=7.4.0",
+    "pytest-cov>=4.1.0",
+    "jupyter>=1.0.0",
+    "ipykernel>=6.25.0",
+    "black>=23.7.0",
+    "flake8>=6.1.0",
+    "seaborn>=0.13.2",
+    "pre-commit>=3.0.0",
 ]

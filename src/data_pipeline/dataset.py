@@ -32,6 +32,10 @@ class ModularCellDataModule(L.LightningDataModule):
     """
     Lightning DataModule for the cell dataset.
 
+    Using the ModularCellDataset assembling configurable DataSource, filters, and transforms into
+    a Pytorch Dataset subclass.
+    Which is used to create dataloaders for training, validation, testing, and prediction.
+
     Example config:
         data:
           h5_path: data/file.h5
@@ -44,10 +48,10 @@ class ModularCellDataModule(L.LightningDataModule):
             min_seg_pixels: 10
             max_nuclei_ratio: 1.2
           transforms:
-            plane_selection: middle
-            normalize_method: minmax
-            gaussian_sigma: 1.0
-            channel_order: [bf, "405"]
+            - class_path: src.data_pipeline.data_transforms.NormalizeTransform
+            - init_args:
+                method: standardize  # Changed to standardize for zero mean and unit variance
+                channel_keys: ['405', 'bf']
     """
 
     def __init__(
@@ -70,15 +74,12 @@ class ModularCellDataModule(L.LightningDataModule):
                             max_nuclei_ratio: Maximum nuclei/cell area ratio
                             force_refilter: Force re-filtering even if cache exists
 
-                            Transform parameters:
-                            plane_selection: Plane selection strategy ('middle', 'first', 'last', 'all')
-                            normalize_method: Normalization method ('minmax' or 'percentile')
-                            normalize_channels: Channels to normalize
-                            apply_gaussian: Whether to apply Gaussian smoothing
-                            gaussian_sigma: Sigma for Gaussian filter
-                            gaussian_channels: Channels to apply Gaussian filter to
-                            channel_order: Order of channels in output
-                            seed: Random seed for reproducibility
+                            Transform parameters (ordered list of transforms):
+                            transforms:
+                            - class_path: src.data_pipeline.data_transforms.NormalizeTransform
+                            init_args:
+                                method: standardize  # Changed to standardize for zero mean and unit variance
+                                channel_keys: ['405', 'bf']
         """
         super().__init__()
         with open(data_config_path, "r") as f:
@@ -88,6 +89,14 @@ class ModularCellDataModule(L.LightningDataModule):
 
         # Store parameters
         self.h5_path = self.config.get("h5_path", None)
+        # Resolve relative path
+        if not Path(self.h5_path).exists():
+            abs_path = Path(__file__).resolve().parent.parent / self.h5_path
+            if Path(abs_path).exists():
+                self.h5_path = abs_path
+            else:
+                raise FileNotFoundError(f"H5 file not found: {self.h5_path}")
+
         self.batch_size = self.config.get("batch_size", 64)
         self.num_workers = self.config.get("num_workers", 0)
         self.data_split = self.config.get("data_split", [0.7, 0.2, 0.1])
@@ -98,7 +107,7 @@ class ModularCellDataModule(L.LightningDataModule):
         self.plane_count = self.config.get("plane_count", 3)
         self.max_objects = self.config.get("max_objects", 1)
         self.min_seg_pixels = self.config.get("min_seg_pixels", 10)
-        self.max_nuclei_ratio = self.config.get("max_nuclei_ratio", 1.2)
+        self.max_nuclei_outside_ratio = self.config.get("max_nuclei_outside_ratio", 1.2)
         self.force_refilter = self.config.get("force_refilter", False)
 
         # Transform parameters
@@ -148,13 +157,13 @@ class ModularCellDataModule(L.LightningDataModule):
             print(f"   - Plane count: {self.plane_count}")
             print(f"   - Max objects: {self.max_objects}")
             print(f"   - Min segmentation pixels: {self.min_seg_pixels}")
-            print(f"   - Max nuclei/cell ratio: {self.max_nuclei_ratio}")
+            print(f"   - Max nuclei outside ratio: {self.max_nuclei_outside_ratio}")
 
             filters = [
                 PlaneCountFilter(expected_planes=self.plane_count),
                 EmptySegmentationFilter(min_pixels=self.min_seg_pixels),
                 MultipleObjectsFilter(max_objects=self.max_objects),
-                CellNucleiOverlappingFilter(max_ratio=self.max_nuclei_ratio),
+                CellNucleiOverlappingFilter(max_ratio=self.max_nuclei_outside_ratio),
             ]
 
             filtered_source = FilteredDataSource(
@@ -164,9 +173,7 @@ class ModularCellDataModule(L.LightningDataModule):
                 force_refilter=self.force_refilter,
             )
 
-            print(
-                f"   ✓ Filtered to {len(filtered_source.get_cell_ids()):,} valid cells"
-            )
+            print(f"   ✓ Filtered to {len(filtered_source.get_cell_ids()):,} valid cells")
 
             data_source = filtered_source
         else:
@@ -175,8 +182,7 @@ class ModularCellDataModule(L.LightningDataModule):
         # 3. Create transform pipeline
         print(f"\n3. Creating preprocessing pipeline:")
         transforms = [
-            resolve(cfg["class_path"])(**cfg.get("init_args", {}))
-            for cfg in self.transform_configs
+            resolve(cfg["class_path"])(**cfg.get("init_args", {})) for cfg in self.transform_configs
         ]
         transform_pipeline = TransformPipeline(transforms)
 
@@ -228,7 +234,13 @@ class ModularCellDataModule(L.LightningDataModule):
 
     def test_dataloader(self) -> DataLoader:
         """Returns test dataloader (uses val dataset for now)."""
-        return self.val_dataloader()
+        return DataLoader(
+            self.test_dataset,
+            batch_size=self.batch_size,
+            shuffle=False,
+            num_workers=self.num_workers,
+            pin_memory=True if self.num_workers > 0 else False,
+        )
 
     def predict_dataloader(self) -> DataLoader:
         """Returns prediction dataloader (full dataset)."""
@@ -244,8 +256,6 @@ class ModularCellDataModule(L.LightningDataModule):
 class ModularCellDataset(Dataset):
     """
     Generic cell dataset that works with any DataSource and Transform pipeline.
-
-    This is a simpler, more modular alternative to the original CellImageDataset.
     """
 
     def __init__(
@@ -294,9 +304,7 @@ class ModularCellDataset(Dataset):
         for channel_name in ["bf", "405"]:
             for plane in cell_data.channels.get(channel_name, None):
                 if plane is None:
-                    raise ValueError(
-                        f"Missing channel {channel_name} for cell {cell_id}"
-                    )
+                    raise ValueError(f"Missing channel {channel_name} for cell {cell_id}")
                 channel_list.append(plane)
         images = np.array(channel_list)
 
@@ -313,7 +321,10 @@ class ModularCellDataset(Dataset):
 
 
 def compute_fucci_labels(
-    cell_data: CellData, mask_intensity: str = "segmentation", debug: bool = False
+    cell_data: CellData,
+    mask_intensity: str = "segmentation",
+    log_transform: bool = False,
+    debug: bool = False,
 ) -> np.ndarray:
     """
     Compute FUCCI mean log intensities (488 and 561) from cell data within the specified mask.
@@ -338,21 +349,15 @@ def compute_fucci_labels(
             planes = cell_data.channels[channel]
             masks = getattr(cell_data, mask_intensity)
             if masks is None:
-                raise ValueError(
-                    f"Missing mask '{mask_intensity}' for intensity computation"
-                )
+                raise ValueError(f"Missing mask '{mask_intensity}' for intensity computation")
             if len(planes) != len(masks):
-                raise ValueError(
-                    f"Channel {channel} planes and segmentation planes count mismatch"
-                )
+                raise ValueError(f"Channel {channel} planes and segmentation planes count mismatch")
             # Compute mean intensity only within mask for each plane
             intensities = []
             for plane, mask in zip(planes, masks):
                 mean_outside_mask = plane[mask == 0].mean()
                 plane_normalized = plane - mean_outside_mask  # Background subtraction
-                plane_normalized = np.clip(
-                    plane_normalized, 0, None
-                )  # Remove negatives
+                plane_normalized = np.clip(plane_normalized, 0, None)  # Remove negatives
                 if debug:
                     show_images(
                         [plane, mask, plane_normalized],
@@ -371,10 +376,12 @@ def compute_fucci_labels(
             assert mean_intensity <= max(
                 [plane.max() for plane in planes]
             ), "Mean intensity exceeds max plane intensity"
-            log_mean_intensity = (
-                np.log(mean_intensity) if mean_intensity > 0.0 else 0.0
-            )  # Log normalization
-            labels.append(log_mean_intensity)
+            if log_transform:
+                mean_intensity = (
+                    np.log(mean_intensity) if mean_intensity > 0.0 else 0.0
+                )  # Log normalization
+
+            labels.append(mean_intensity)
         else:
             raise ValueError(f"Channel {channel} not found in cell data")
 
