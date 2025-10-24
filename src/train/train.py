@@ -1,25 +1,28 @@
 #!/usr/bin/env python
 """
-Manual training script with explicit callback initialization.
-This script provides full control over training setup without using Lightning CLI.
+Unified training script for cell cycle prediction using PyTorch Lightning or XGBoost.
+
+This script provides full control over training, validation, and hyperparameter tuning for both Lightning and XGBoost backends, with explicit callback and logger initialization. XGBoost training and sweep logic is unified to avoid code duplication.
 
 Usage:
     # Train with PyTorch Lightning
-    python src/train/train.py lightning \\
-        --data-config configs/data_config.yaml \\
-        --trainer-config configs/trainer_config.yaml \\
-        --model-config configs/model_config.yaml
-    
+    python src/train/train.py lightning \
+        --config configs/lightning_config.yaml
+
     # Train with XGBoost
-    python src/train/train.py xgboost \\
-        --data-config configs/data_config.yaml \\
-        --model-config configs/model_config.yaml
-    
-    # XGBoost hyperparameter tuning
-    python src/train/train.py xgboost --tune \\
-        --data-config configs/data_config.yaml \\
-        --model-config configs/model_config.yaml \\
-        --sweep-config configs/xgboost_sweep.yaml
+    python src/train/train.py xgboost \
+        --config configs/xgboost/xgboost_config.yaml
+
+    # XGBoost hyperparameter tuning (W&B sweep)
+    python src/train/train.py xgboost --tune \
+        --config configs/xgboost/xgboost_config.yaml \
+        --sweep-config configs/xgboost/xgboost_sweep.yaml
+
+Key Functions:
+    - run_lightning: Standard Lightning training, validation, and test.
+    - run_xgboost: Standard XGBoost training, validation, and test using unified logic.
+    - run_xgboost_tune: W&B sweep for XGBoost, using unified logic for each trial.
+    - train_and_evaluate_xgboost: Unified logic for XGBoost training, validation, test, and model saving. Used by both normal and sweep modes.
 """
 
 import importlib
@@ -197,12 +200,11 @@ def create_model(model_config: Optional[Dict[str, Any]]):
 
 
 def run_lightning(config: Dict):
-    """Run Lightning training with automatic validation and test evaluation.
+    """
+    Run Lightning training with automatic validation and test evaluation.
 
     Args:
-        data_config: Path to data configuration YAML
-        trainer_config_path: Path to trainer configuration YAML
-        model_config_path: Path to model configuration YAML
+        config: Dictionary containing 'trainer', 'model', and 'data' config sections.
     """
     # load configs
     trainer_config = config.get("trainer", {})
@@ -285,11 +287,17 @@ def xgboost_training_setup(
     data_config: str,
     wandb_run: Optional[wandb.sdk.wandb_run.Run] = None,
 ):
-    """Initialize trainer with data configuration.
+    """
+    Initialize XGBoostCellCycleTrainer and split data for XGBoost workflow.
 
     Args:
-        data_config_path: Path to data configuration YAML
-        use_wandb: Whether to log to Weights & Biases
+        data_config: Data configuration dictionary
+        wandb_run: Optional W&B run object
+
+    Returns:
+        trainer: XGBoostCellCycleTrainer instance
+        train_df: Training DataFrame
+        test_df: Test DataFrame
     """
 
     dataset = ModularCellFeaturesDataset(data_config=data_config)
@@ -317,6 +325,20 @@ def train_and_evaluate_xgboost(
 ):
     """
     Unified XGBoost training and evaluation logic for both normal and sweep modes.
+
+    Args:
+        params: XGBoost hyperparameters (dict)
+        trainer: XGBoostCellCycleTrainer instance
+        wandb_run: W&B run object for logging
+        model_suffix: Suffix to append to model filename (e.g., for sweeps)
+        save_model: Whether to save the trained model to disk
+        test_df: Optional test DataFrame for evaluation
+
+    Returns:
+        trainer: The fitted XGBoostCellCycleTrainer instance
+        metrics: Validation metrics dictionary
+        test_metrics: Test metrics dictionary (if test_df provided)
+        model_path: Path to saved model (if saved)
     """
 
     if wandb_run:
@@ -354,11 +376,12 @@ def train_and_evaluate_xgboost(
 
 
 def run_xgboost(config: dict, project_name: str):
-    """Run XGBoost training/validation/testing.
+    """
+    Run XGBoost training/validation/testing using unified logic.
 
     Args:
-        data_config: Data configuration dictionary
-        model_config: Model/hyperparameter configuration dictionary
+        config: Dictionary containing 'data_config' and 'model_config' sections
+        project_name: W&B project name
     """
 
     data_config = config.get("data_config", {})
@@ -386,15 +409,14 @@ def run_xgboost_tune(
     project_name: str,
     count: Optional[int] = None,
 ):
-    """Run W&B hyperparameter sweep for XGBoost.
-
-    This function runs the sweep trials directly in-process, making it a single
-    command to run hyperparameter tuning.
+    """
+    Run W&B hyperparameter sweep for XGBoost using unified logic for each trial.
 
     Args:
-        data_config: Data configuration dictionary
+        config: Dictionary containing 'data' section
         sweep_config: W&B sweep configuration dictionary
-        default_model_config: Default model configuration dictionary
+        project_name: W&B project name
+        count: Number of sweep trials to run
     """
 
     # Extract project name and count from sweep config
@@ -419,10 +441,9 @@ def run_xgboost_tune(
 
     def train_trial():
         with wandb.init(project=project_name, config=config) as run:
-            params = run.config
             # Use unified function
             train_and_evaluate_xgboost(
-                params=params,
+                params=run.config,
                 trainer=trainer,
                 test_df=test_df,
                 wandb_run=run,
@@ -447,7 +468,7 @@ def run_xgboost_tune(
 def main():
     """
     Entry point for the script.
-    Parse command line arguments and start training.
+    Parses command line arguments and dispatches to the selected backend.
     """
     args = parse_args()
 
