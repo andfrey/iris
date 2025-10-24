@@ -11,17 +11,31 @@ from skimage.measure import label, regionprops
 
 
 class FeatureExtractor:
-    """Klasse für Feature-Extraktion - getrennt von der Datenladung."""
+    """Class for feature extraction — separated from data loading.
+
+    Provides methods to extract morphological and intensity-based features
+    from microscopy images and segmentation masks.
+    """
 
     def extract_morphological_features(
         self, image: np.ndarray, mask: np.ndarray, cell_name: str, type: str
     ) -> Dict:
-        """Extrahiert morphologische Features aus Zellbildern."""
+        """Extract morphological features from a labeled region.
+
+        Args:
+            image: intensity image used to compute intensity-based props
+            mask: binary mask containing the region of interest
+            cell_name: identifier for logging/errors
+            type: prefix used for returned feature names (e.g., 'cell' or 'nucleus')
+        Returns:
+            A dict of morphological feature values.
+        """
+        mask[mask > 0] = 1.0  # ensure binary mask
         labeled_mask = label(mask)
         properties = regionprops(labeled_mask, intensity_image=image)
 
         if not properties:
-            return self._get_empty_morphological_features(cell_name, type)
+            raise ValueError(f"No regions found in mask for cell {cell_name}.")
 
         prop = properties[0]
         return {
@@ -36,60 +50,48 @@ class FeatureExtractor:
         }
 
     def extract_intensity_features(
-        self, image: np.ndarray, mask: np.ndarray, channel: str
+        self, image: np.ndarray, mask_nucleus: np.ndarray, mask_cell: np.ndarray
     ) -> Dict:
-        """Extrahiert Intensitäts-Features."""
-        # Intensität innerhalb und außerhalb der Maske
-        total_intensity_inside = np.sum(image[mask > 0])
-        total_intensity_outside = np.sum(image[mask == 0])
-        total_intensity = total_intensity_inside + total_intensity_outside
+        """Extract simple intensity summary features.
+
+        Computes total intensity inside the nucleus and total intensity in the
+        cytoplasm (cell mask minus nucleus mask).
+        """
+        # total intensity inside nucleus
+        total_intensity_nucleus = np.sum(image[mask_nucleus > 0])
+
+        # cytoplasm = cell mask AND not nucleus
+        cytoplasm_mask = (mask_cell > 0) & (mask_nucleus == 0)
+        total_intensity_outside_nucleus = np.sum(image[cytoplasm_mask])
 
         features = {
-            "intensity_inside": total_intensity_inside,
-            "intensity_outside": total_intensity_outside,
+            "total_intensity_nucleus": total_intensity_nucleus,
+            "total_intensity_outside_nucleus": total_intensity_outside_nucleus,
         }
-
-        if total_intensity > 0:
-            features["intensity_ratio_outside_inside"] = (
-                total_intensity_outside / total_intensity_inside
-                if total_intensity_inside > 0
-                else np.inf
-            )
-            features["intensity_fraction_outside"] = (
-                total_intensity_outside / total_intensity
-            )
-        else:
-            features["intensity_ratio_outside_inside"] = 0
-            features["intensity_fraction_outside"] = 0
 
         return features
 
-    def extract_all_features(self, cell_data: Dict, cell_name: str) -> Dict:
-        """Extrahiert alle Features für eine Zelle."""
-        features = {"cell_name": cell_name}
+    def extract_all_features(self, cell_data) -> Dict:
+        """Extract all features for a single cell data dict.
 
-        # Prüfe ob alle erforderlichen Kanäle vorhanden sind
-        required_channels = ["405", "seg", "561", "488"]
-        if not all(ch in cell_data for ch in required_channels):
-            return features
-
+        The input `cell_data` is expected to be a CellData object with channels
+        ('405', '561', '488') and segmentation masks (segmentation, nuclei_segmentation).
+        """
+        features = {}
         try:
-            # Nimm mittlere Ebene jedes Kanals
-            middle_idx = len(cell_data["405"]) // 2
+            middle_idx = len(cell_data.channels["405"]) // 2
 
-            nucleus_image = cell_data["405"][middle_idx]
-            seg_mask = cell_data["seg"][middle_idx]
-            red_image = cell_data["561"][middle_idx]
-            green_image = cell_data["488"][middle_idx]
-            nuclei_seg_mask = cell_data["nuclei_seg"][middle_idx]
-            # Morphologische Features
+            nucleus_image = cell_data.channels["405"][middle_idx]
+            seg_mask = cell_data.segmentation[middle_idx]
+            nuclei_seg_mask = cell_data.nuclei_segmentation[middle_idx]
+            cell_name = cell_data.metadata.get("cell_id", None)
+            # extract morphological features
             morphological_features_cell = self.extract_morphological_features(
                 nucleus_image, seg_mask, cell_name, type="cell"
             )
-            if "nuclei_seg" in cell_data:
-                morphological_features_nucleus = self.extract_morphological_features(
-                    nucleus_image, nuclei_seg_mask, cell_name, type="nucleus"
-                )
+            morphological_features_nucleus = self.extract_morphological_features(
+                nucleus_image, nuclei_seg_mask, cell_name, type="nucleus"
+            )
 
             features.update(morphological_features_cell)
             features.update(morphological_features_nucleus)
@@ -100,27 +102,15 @@ class FeatureExtractor:
                 if morphological_features_cell["cell_area"] > 0
                 else 0
             )
-            # Intensitäts-Features
+
+            # Intensity features: note the correct ordering of args (nucleus, cell mask)
             intensity_features = self.extract_intensity_features(
-                nucleus_image, seg_mask, "405"
+                nucleus_image, nuclei_seg_mask, seg_mask
             )
             features.update(intensity_features)
 
-        except Exception as e:
-            print(f"Fehler beim Extrahieren der Features für {cell_name}:")
+        except Exception:
+            print(f"Error extracting features for {cell_name}:")
             traceback.print_exc()
 
         return features
-
-    def _get_empty_morphological_features(self, cell_name: str, type: str) -> Dict:
-        """Gibt leere morphologische Features zurück."""
-        return {
-            f"{type}_area": 0,
-            f"{type}_perimeter": 0,
-            f"{type}_mean_intensity": 0,
-            f"{type}_eccentricity": 0,
-            f"{type}_solidity": 0,
-            f"{type}_extent": 0,
-            f"{type}_major_axis_length": 0,
-            f"{type}_minor_axis_length": 0,
-        }
