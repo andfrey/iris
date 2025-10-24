@@ -2,30 +2,67 @@
 Modern PyTorch Dataset implementation using the new modular architecture.
 """
 
-import importlib
 import torch
 from torch.utils.data import Dataset, DataLoader, random_split
 from typing import Optional, List, Dict, Any, Tuple
 from pathlib import Path
 import numpy as np
 import lightning as L
+from tqdm import tqdm
 import yaml
-from functools import partial
-
-from .data_sources import DataSource, H5DataSource, FilteredDataSource, CellData
-from .data_transforms import Transform, TransformPipeline
-from .data_filters import (
-    PlaneCountFilter,
-    EmptySegmentationFilter,
-    MultipleObjectsFilter,
-    CellNucleiOverlappingFilter,
+from .utils import (
+    save_parquet_cache,
+    load_parquet_cache,
+    make_hash_from_dict,
+    create_data_source_from_config,
+    create_transform_pipeline_from_config,
 )
+import pandas as pd
 
 
-def resolve(name: str):
-    module_name, attr_name = name.rsplit(".", 1)
-    module = importlib.import_module(module_name)
-    return getattr(module, attr_name)
+from .data_sources import DataSource, CellData
+from .data_transforms import Transform
+from .feature_extractor import FeatureExtractor
+
+
+# === BaseCellDataset ===
+class BaseCellDataset(Dataset):
+    def __init__(
+        self,
+        data_source: DataSource,
+        transform: Optional[Transform] = None,
+        mask_intensity: str = "segmentation",
+        debug: bool = False,
+        scale_divider_488: float = 1.0,
+        scale_divider_561: float = 1.0,
+    ):
+        self.data_source = data_source
+        self.transform = transform
+        self.mask_intensity = mask_intensity
+        self.debug = debug
+        self.scale_divider_488 = scale_divider_488
+        self.scale_divider_561 = scale_divider_561
+        print(f"✓ Scale dividers: 488={self.scale_divider_488}, 561={self.scale_divider_561}")
+        self.fucci_scaler = np.array([self.scale_divider_488, self.scale_divider_561])
+        self.cell_ids = data_source.get_cell_ids()
+        print(f"✓ Dataset initialized with {len(self.cell_ids):,} cells")
+
+    def __len__(self) -> int:
+        return len(self.cell_ids)
+
+    def get_cell_data(self, idx: int):
+        cell_id = self.cell_ids[idx]
+        cell_data = self.data_source.load_cell(cell_id)
+        if self.transform:
+            cell_data = self.transform(cell_data)
+        return cell_data
+
+    def compute_labels(self, cell_data):
+        labels = compute_fucci_labels(
+            cell_data, mask_intensity=self.mask_intensity, debug=self.debug
+        )
+        labels = labels / self.fucci_scaler
+        return labels
 
 
 class ModularCellDataModule(L.LightningDataModule):
@@ -102,16 +139,19 @@ class ModularCellDataModule(L.LightningDataModule):
         self.data_split = self.config.get("data_split", [0.7, 0.2, 0.1])
         self.seed = self.config.get("seed", 42)  # For reproducibility
 
-        # Filter parameters
-        self.use_quality_filters = self.config.get("use_quality_filters", True)
-        self.plane_count = self.config.get("plane_count", 3)
-        self.max_objects = self.config.get("max_objects", 1)
-        self.min_seg_pixels = self.config.get("min_seg_pixels", 10)
-        self.max_nuclei_outside_ratio = self.config.get("max_nuclei_outside_ratio", 1.2)
-        self.force_refilter = self.config.get("force_refilter", False)
-
-        # Transform parameters
-        self.transform_configs = self.config.get("transforms", [])
+        if self.config.get("fucci_scale_transform", None) is not None:
+            if (
+                not "scale_divider_488" in self.config["fucci_scale_transform"]
+                or not "scale_divider_561" in self.config["fucci_scale_transform"]
+            ):
+                raise ValueError(
+                    "fucci_scale_transform requires 'scale_divider_488' and 'scale_divider_561' in data_config"
+                )
+            self.scale_divider_488 = self.config["fucci_scale_transform"]["scale_divider_488"]
+            self.scale_divider_561 = self.config["fucci_scale_transform"]["scale_divider_561"]
+        else:
+            self.scale_divider_488 = 1.0
+            self.scale_divider_561 = 1.0
 
         # Datasets (initialized in setup)
         self.train_dataset = None
@@ -143,53 +183,18 @@ class ModularCellDataModule(L.LightningDataModule):
         print("Setting up ModularCellDataModule")
         print("=" * 60)
 
-        # 1. Create data source
-        print(f"\n1. Creating data source from: {self.h5_path}")
-        data_source = H5DataSource(
-            path=self.h5_path,
-            plane_selection="all",  # Load all planes, select later in transform
+        data_source = create_data_source_from_config(self.config)
+        transform_pipeline = create_transform_pipeline_from_config(
+            self.config, transform_type="image"
         )
-        print(f"   ✓ Found {len(data_source.get_cell_ids()):,} total cells")
-
-        # 2. Apply quality filters (optional)
-        if self.use_quality_filters:
-            print(f"\n2. Applying quality filters:")
-            print(f"   - Plane count: {self.plane_count}")
-            print(f"   - Max objects: {self.max_objects}")
-            print(f"   - Min segmentation pixels: {self.min_seg_pixels}")
-            print(f"   - Max nuclei outside ratio: {self.max_nuclei_outside_ratio}")
-
-            filters = [
-                PlaneCountFilter(expected_planes=self.plane_count),
-                EmptySegmentationFilter(min_pixels=self.min_seg_pixels),
-                MultipleObjectsFilter(max_objects=self.max_objects),
-                CellNucleiOverlappingFilter(max_ratio=self.max_nuclei_outside_ratio),
-            ]
-
-            filtered_source = FilteredDataSource(
-                data_source=data_source,
-                filters=filters,
-                cache_results=True,
-                force_refilter=self.force_refilter,
-            )
-
-            print(f"   ✓ Filtered to {len(filtered_source.get_cell_ids()):,} valid cells")
-
-            data_source = filtered_source
-        else:
-            print(f"\n2. Skipping quality filters")
-
-        # 3. Create transform pipeline
-        print(f"\n3. Creating preprocessing pipeline:")
-        transforms = [
-            resolve(cfg["class_path"])(**cfg.get("init_args", {})) for cfg in self.transform_configs
-        ]
-        transform_pipeline = TransformPipeline(transforms)
 
         # 4. Create full dataset
         print(f"\n4. Creating PyTorch dataset")
-        self.full_dataset = ModularCellDataset(
-            data_source=data_source, transform=transform_pipeline
+        self.full_dataset = ModularCellImageDataset(
+            data_source=data_source,
+            transform=transform_pipeline,
+            scale_divider_488=self.scale_divider_488,
+            scale_divider_561=self.scale_divider_561,
         )
 
         # 5. Split into train/val
@@ -253,71 +258,219 @@ class ModularCellDataModule(L.LightningDataModule):
         )
 
 
-class ModularCellDataset(Dataset):
+class ModularCellImageDataset(BaseCellDataset):
     """
-    Generic cell dataset that works with any DataSource and Transform pipeline.
+    Generic cell image dataset that works with any DataSource and Transform pipeline.
     """
-
-    def __init__(
-        self,
-        data_source: DataSource,
-        transform: Optional[Transform] = None,
-        mask_intensity: str = "segmentation",
-        debug: bool = False,
-    ):
-        """
-        Args:
-            data_source: DataSource instance (can be FilteredDataSource)
-            transform: Transform pipeline for preprocessing
-        """
-        self.data_source = data_source
-        self.transform = transform
-        self.mask_intensity = mask_intensity
-        self.debug = debug
-        # Get cell IDs
-        self.cell_ids = data_source.get_cell_ids()
-        print(f"✓ Dataset initialized with {len(self.cell_ids):,} cells")
-
-    def __len__(self) -> int:
-        return len(self.cell_ids)
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Returns:
-            Tuple of (images, labels) where:
-            - images: Tensor of shape (C, H, W)
-            - labels: Tensor of shape (2,) with [488_intensity, 561_intensity]
-        """
-        cell_id = self.cell_ids[idx]
-        cell_data = self.data_source.load_cell(cell_id)
-
-        # Compute FUCCI labels (488 and 561 intensities)
-        labels = compute_fucci_labels(
-            cell_data, mask_intensity=self.mask_intensity, debug=self.debug
-        )
-
-        # Apply transforms
-        if self.transform:
-            cell_data = self.transform(cell_data)
-
+        cell_data = self.get_cell_data(idx)
+        labels = self.compute_labels(cell_data)
         channel_list = []
         for channel_name in ["bf", "405"]:
             for plane in cell_data.channels.get(channel_name, None):
                 if plane is None:
-                    raise ValueError(f"Missing channel {channel_name} for cell {cell_id}")
+                    raise ValueError(
+                        f"Missing channel {channel_name} for cell {self.cell_ids[idx]}"
+                    )
                 channel_list.append(plane)
         images = np.array(channel_list)
-
-        # Ensure float32 and proper shape (C, H, W)
         images = images.astype(np.float32)
         if images.ndim == 2:
-            images = images[np.newaxis, :]  # Add channel dim
-
-        # Convert to tensors
+            images = images[np.newaxis, :]
         images_tensor = torch.from_numpy(images)
         labels_tensor = torch.from_numpy(labels).float()
-
         return images_tensor, labels_tensor
+
+
+class ModularCellFeaturesDataset(BaseCellDataset):
+    """
+    Generic cell features dataset that works with any DataSource and Transform pipeline.
+    """
+
+    def __init__(
+        self,
+        data_config: dict,
+        mask_intensity: str = "segmentation",
+        debug: bool = False,
+        use_cache: bool = True,
+    ):
+        # Set up transforms and config
+        self.config = data_config
+        self.use_cache = use_cache
+        self.image_transform = create_transform_pipeline_from_config(
+            self.config, transform_type="image"
+        )
+        self.feature_transform = create_transform_pipeline_from_config(
+            self.config, transform_type="feature"
+        )
+        # Create data source
+        data_source = create_data_source_from_config(self.config)
+        # Call base class init
+        super().__init__(
+            data_source=data_source,
+            transform=self.image_transform,
+            mask_intensity=mask_intensity,
+            debug=debug,
+            scale_divider_488=self.config.get("fucci_scale_transform", {}).get(
+                "scale_divider_488", 1.0
+            ),
+            scale_divider_561=self.config.get("fucci_scale_transform", {}).get(
+                "scale_divider_561", 1.0
+            ),
+        )
+        self.feature_extractor = FeatureExtractor()
+        self.df = None
+
+    def _get_cache_key(self) -> str:
+        """Generate a cache key based on dataset configuration."""
+        cache_params = {
+            "cell_ids": sorted(self.cell_ids),
+            "mask_intensity": self.mask_intensity,
+            "image_transform_config": (
+                self.image_transform.get_config() if self.image_transform else None
+            ),
+            "fucci_scale_transform": {
+                "scale_divider_488": self.scale_divider_488,
+                "scale_divider_561": self.scale_divider_561,
+            },
+        }
+        cache_hash = make_hash_from_dict(cache_params, length=12)
+        return f"features_{cache_hash}"
+
+    def _get_cache_dir(self) -> Path:
+        """Get the cache directory for storing feature files."""
+        if hasattr(self.data_source, "path"):
+            source_path = Path(self.data_source.path)
+        elif hasattr(self.data_source, "data_source") and hasattr(
+            self.data_source.data_source, "path"
+        ):
+            source_path = Path(self.data_source.data_source.path)
+        else:
+            raise ValueError("Cannot determine data source path for caching")
+        cache_dir = source_path.parent / "features"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        return cache_dir
+
+    def _get_cache_path(self) -> Path:
+        cache_dir = self._get_cache_dir()
+        cache_key = self._get_cache_key()
+        return cache_dir / f"{cache_key}.parquet"
+
+    def _load_cached_df(self) -> Optional[pd.DataFrame]:
+        if not self.use_cache:
+            return None
+        cache_path = self._get_cache_path()
+        df = load_parquet_cache(str(cache_path))
+        return df
+
+    def _save_cached_df(self, df: pd.DataFrame):
+        if not self.use_cache:
+            return
+        cache_path = self._get_cache_path()
+        save_parquet_cache(df, str(cache_path))
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        cell_data = self.get_cell_data(idx)
+        labels = self.compute_labels(cell_data)
+        features = self.feature_extractor.extract_all_features(cell_data)
+        return features, labels
+
+    def get_dataset_df(self, force_recompute: bool = False) -> pd.DataFrame:
+        """Get dataset as a Pandas DataFrame with caching support.
+
+        Args:
+            force_recompute: If True, ignore cache and recompute features
+
+        Returns:
+            DataFrame with features and labels
+        """
+        df = None
+        # Try to load from cache first
+        if not force_recompute:
+            cached_df = self._load_cached_df()
+            if cached_df is not None:
+                df = cached_df
+        if df is None:
+            # Cache miss or force recompute - extract features
+            print(f"Extracting features from {len(self)} samples...")
+            features_list = []
+            labels_list = []
+            for idx in tqdm(range(len(self)), desc="Extracting features"):
+                try:
+                    features, labels = self[idx]
+                    features_list.append(features)
+                    labels_list.append(labels)
+                except Exception as e:
+                    print(f"Warning: Failed to extract features for sample {idx}: {e}")
+                    continue
+
+            # Create DataFrame
+            df = pd.DataFrame(features_list)
+            df["label_488"] = [label[0] for label in labels_list]
+            df["label_561"] = [label[1] for label in labels_list]
+
+            # Save to cache
+            self._save_cached_df(df)
+        # # Remove outliers based on label_488 and label_561
+        # for label in ["label_488", "label_561"]:
+        #     q_low = df[label].quantile(0.01)
+        #     q_high = df[label].quantile(0.99)
+        #     df = df[(df[label] >= q_low) & (df[label] <= q_high)]
+        #     print(f"Removed outliers in {label}: kept {len(df)} samples")
+
+        if self.feature_transform:
+            feature_df = df.drop(columns=["label_488", "label_561"])
+            print("Applying feature transformations...")
+            self.feature_transform.fit(feature_df)
+            feature_array = self.feature_transform.transform(feature_df)
+            transformed_feature_df = pd.DataFrame(feature_array, columns=feature_df.columns)
+            transformed_feature_df["label_488"] = df["label_488"].values
+            transformed_feature_df["label_561"] = df["label_561"].values
+            df = transformed_feature_df
+
+        self.df = df
+        return self.df
+
+    @staticmethod
+    def split_X_y(dataset_df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Split the dataset into features (X) and labels (y).
+        Returns:
+            Tuple of (X, y) where:
+            - X: Numpy array of features
+            - y: Numpy array of labels with shape (N, 2) for [488_intensity, 561_intensity]
+        """
+        X = dataset_df.drop(columns=["label_488", "label_561"]).values
+        y = dataset_df[["label_488", "label_561"]].values
+        return X, y
+
+    def split_train_test_set(self) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        """
+        Split the dataset into training and testing subsets.
+
+        Args:
+            train_ratio: Proportion of data to use for training (default: 0.8)
+            seed: Random seed for reproducibility
+
+        Returns:
+            Tuple of (train_dataset, test_dataset)
+        """
+        # Set random seed for reproducibility
+        np.random.seed(self.config.get("seed", 42))
+        train_ratio = self.config.get("train_test_ratio", 0.9)
+
+        dataset_df = self.get_dataset_df()
+        # Shuffle dataset indices
+        indices = np.random.permutation(len(dataset_df))
+        train_size = int(len(dataset_df) * train_ratio)
+        train_indices = indices[:train_size]
+        test_indices = indices[train_size:]
+
+        train_dataset = dataset_df.iloc[train_indices]
+        test_dataset = dataset_df.iloc[test_indices]
+
+        return train_dataset, test_dataset
 
 
 def compute_fucci_labels(

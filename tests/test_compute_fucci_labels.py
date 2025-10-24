@@ -10,7 +10,7 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from src.data_pipeline.dataset import compute_fucci_labels, ModularCellDataset
+from src.data_pipeline.dataset import compute_fucci_labels, ModularCellImageDataset
 from src.data_pipeline.data_sources import CellData
 
 
