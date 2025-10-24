@@ -16,9 +16,11 @@
   min_seg_pixels: 10
   max_nuclei_outside_ratio: 0.2
   force_refilter: false  # Use cached results if available
-
+  fucci_scale_transform:
+    scale_divider_488: 16464.0
+    scale_divider_561: 31173.0
   # Preprocessing transforms
-  transforms:
+  image_transforms_config:
     - class_path: src.data_pipeline.data_transforms.NormalizeTransform
       init_args:
         method: standardize  # Changed to standardize for zero mean and unit variance
