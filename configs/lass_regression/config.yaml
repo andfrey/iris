@@ -1,36 +1,9 @@
 model:
-  # XGBoost Model Configuration
+  # LASSO Regression Model Configuration
 
-  # Default XGBoost hyperparameters (used for single fit runs)
-  # Learning rate (eta)
-  learning_rate: 0.035376
-
-  # Maximum tree depth
-  max_depth: 3
-
-  # Number of boosting rounds
-  n_estimators: 300
-
-  # Subsample ratio of training instances
-  subsample: 0.89234
-
-  # Subsample ratio of columns when constructing each tree
-  colsample_bytree: 0.70208
-
-  # Minimum sum of instance weight needed in a child
-  min_child_weight: 1
-
-  # L2 regularization term on weights
-  reg_lambda: 3.5
-
-  # L1 regularization term on weights
-  reg_alpha: 0.0
-
-  # Minimum loss reduction required to make a further partition
-  gamma: 0.0041141
-
-  # Random seed
-  random_state: 42
+  # Default LASSO hyperparameters (used for single fit runs)
+  # Regularization strength
+  alpha: 1.0
 
 data:
   # Data source
