@@ -19,9 +19,10 @@ try:
     WANDB_AVAILABLE = True
 except ImportError:
     WANDB_AVAILABLE = False
-sys.path.append(str(Path(__file__).resolve().parent.parent))
+sys.path.append(str(Path(__file__).resolve().parent.parent.parent))
 
 from src.data_pipeline.dataset import ModularCellFeaturesDataset
+from src.train.utils import evaluate_regression, train_val_split
 
 
 class XGBoostCellCycleTrainer:
@@ -68,12 +69,10 @@ class XGBoostCellCycleTrainer:
         self.wandb_run = wandb_run
 
     def prepare_dataset(self) -> Tuple[np.ndarray, np.ndarray]:
-        train_size = int(len(self.training_data) * self.train_val_split_ratio)
-        train_data = self.training_data.iloc[:train_size]
-        val_data = self.training_data.iloc[train_size:]
-
-        X_train, y_train = ModularCellFeaturesDataset.split_X_y(train_data)
-        X_val, y_val = ModularCellFeaturesDataset.split_X_y(val_data)
+        X_train, y_train = ModularCellFeaturesDataset.split_X_y(self.training_data)
+        X_train, y_train, X_val, y_val = train_val_split(
+            X_train, y_train, self.train_val_split_ratio, random_state=42
+        )
 
         self.X_train = X_train
         self.y_train = y_train
@@ -106,11 +105,29 @@ class XGBoostCellCycleTrainer:
         )
         # Evaluate and log metrics
         metrics = self.evaluate()
-        # Log feature importances
         self.log_feature_importance()
-        # log error scatter plot
-        self.plot_error_scatter()
         return self.model, metrics
+
+    def evaluate(self) -> Dict[str, float]:
+        metrics = {}
+
+        train_metrics = evaluate_regression(
+            self.y_train * self.fucci_scalers,
+            self.model.predict(self.X_train) * self.fucci_scalers,
+            prefix="train",
+            wandb_run=self.wandb_run,
+            plot=False,
+        )
+        metrics.update(train_metrics)
+        val_metrics = evaluate_regression(
+            self.y_val * self.fucci_scalers,
+            self.model.predict(self.X_val) * self.fucci_scalers,
+            prefix="val",
+            wandb_run=self.wandb_run,
+            plot=True,
+        )
+        metrics.update(val_metrics)
+        return metrics
 
     def log_feature_importance(self):
         """Log feature importances using model's booster."""
@@ -128,94 +145,6 @@ class XGBoostCellCycleTrainer:
         print(importance_df)
         if self.wandb_run is not None:
             self.wandb_run.log({"feature_importance": wandb.Table(dataframe=importance_df)})
-
-    def plot_error_scatter(self, X=None, y=None, title="Error Scatter Plot", x_axis=0, y_axis=1):
-        """
-        Visualize squared error on a 2D scatter plot.
-        Args:
-            X: Features (default: validation set)
-            y: True labels (default: validation set)
-            title: Plot title
-            x_axis: Feature index for x-axis
-            y_axis: Feature index for y-axis
-        """
-        import matplotlib.pyplot as plt
-
-        if X is None:
-            X = self.X_val
-        if y is None:
-            y = self.y_val
-        X = X
-        y = y * self.fucci_scalers
-        preds = self.model.predict(X) * self.fucci_scalers
-        errors = np.linalg.norm(preds - y, axis=1)
-
-        plt.figure(figsize=(8, 6))
-        sc = plt.scatter(np.log(y[:, 0]), np.log(y[:, 1]), c=errors, cmap="Blues", alpha=0.7)
-        plt.colorbar(sc, label="Norm Error")
-        plt.xlabel(f"Log 488 Intensity")
-        plt.ylabel(f"Log 561 Intensity")
-        plt.title(title)
-        plt.tight_layout()
-        plt.show()
-        if self.wandb_run is not None:
-            self.wandb_run.log({"error_scatter": wandb.Image(plt)})
-
-    def evaluate(
-        self, X: np.ndarray = None, y: np.ndarray = None, prefix: str = "train"
-    ) -> Dict[str, float]:
-        """Evaluate model on a dataset.
-
-        Args:
-            X: Features
-            y: Labels
-            prefix: Metric prefix (e.g., 'test', 'val')
-
-        Returns:
-            Dictionary of metrics
-        """
-        if prefix != "train" and (X is None or y is None):
-            raise ValueError("X and y must be provided for non-training evaluation")
-
-        if self.model is None:
-            raise ValueError("Model not trained yet")
-
-        if prefix == "train":
-            val_preds = self.model.predict(self.X_val) * self.fucci_scalers
-            train_preds = self.model.predict(self.X_train) * self.fucci_scalers
-            val_true = self.y_val * self.fucci_scalers
-            train_true = self.y_train * self.fucci_scalers
-            val_mse = mean_squared_error(val_true, val_preds)
-            train_mse = mean_squared_error(train_true, train_preds)
-            val_mae = mean_absolute_error(val_true, val_preds)
-            train_mae = mean_absolute_error(train_true, train_preds)
-            val_r2 = r2_score(val_true, val_preds)
-            train_r2 = r2_score(train_true, train_preds)
-
-            metrics = {
-                f"val_mse": val_mse,
-                f"train_mse": train_mse,
-                f"val_mae": val_mae,
-                f"train_mae": train_mae,
-                f"val_r2": val_r2,
-                f"train_r2": train_r2,
-            }
-        else:
-            y = y * self.fucci_scalers
-            preds = self.model.predict(X) * self.fucci_scalers
-            mse = mean_squared_error(y, preds)
-            mae = mean_absolute_error(y, preds)
-            r2 = r2_score(y, preds)
-
-            metrics = {
-                f"{prefix}_mse": mse,
-                f"{prefix}_mae": mae,
-                f"{prefix}_r2": r2,
-            }
-        if self.wandb_run is not None:
-            self.wandb_run.log(metrics)
-
-        return metrics
 
     def save_model(self, path: str):
         """Save trained model to disk.

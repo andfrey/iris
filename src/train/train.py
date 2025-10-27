@@ -55,6 +55,7 @@ from lightning.pytorch.callbacks import (
     DeviceStatsMonitor,
 )
 from lightning.pytorch.loggers import WandbLogger
+from sklearn.linear_model import Lasso
 import wandb
 
 
@@ -62,6 +63,7 @@ import wandb
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from src.models.cnet import CNet
+from src.train.utils import evaluate_regression, train_val_split
 from src.models.xgboost_trainer import XGBoostCellCycleTrainer
 from src.data_pipeline.dataset import ModularCellDataModule, ModularCellFeaturesDataset
 
@@ -74,6 +76,7 @@ FILE_DIR_PATH = Path(__file__).resolve().parent
 
 MODELS = {
     "CNet": CNet,
+    "lasso": Lasso,
 }
 
 
@@ -113,6 +116,36 @@ def parse_args():
         "xgboost",
         parents=[common_parser],
         help="Train with XGBoost and evaluate on validation/test sets",
+    )
+
+    # Lasso regression backend
+    lasso_parser = subparsers.add_parser(
+        "lasso",
+        parents=[common_parser],
+        help="Train with Lasso Regression (sklearn) and evaluate on validation/test sets",
+    )
+    lasso_parser.add_argument(
+        "--tune",
+        action="store_true",
+        help="Run hyperparameter sweep with W&B instead of single training run",
+    )
+    lasso_parser.add_argument(
+        "--sweep-config",
+        type=str,
+        default=None,
+        help="Path to W&B sweep configuration YAML (used with --tune)",
+    )
+    lasso_parser.add_argument(
+        "--count",
+        type=int,
+        default=None,
+        help="Number of sweep trials to run (used with --tune, default: run until stopped)",
+    )
+    lasso_parser.add_argument(
+        "--project",
+        type=str,
+        default=None,
+        help="W&B project name",
     )
 
     # Add tune flag for XGBoost hyperparameter sweep
@@ -355,7 +388,13 @@ def train_and_evaluate_xgboost(
     test_X, test_y = None, None
     if test_df is not None:
         test_X, test_y = ModularCellFeaturesDataset.split_X_y(test_df)
-        test_metrics = trainer.evaluate(test_X, test_y, prefix="test")
+        test_metrics = evaluate_regression(
+            test_y * trainer.fucci_scalers,
+            model.predict(test_X) * trainer.fucci_scalers,
+            prefix="test",
+            plot=False,
+            wandb_run=wandb_run,
+        )
         print(f"\nTest Metrics:")
         for k, v in test_metrics.items():
             print(f"  {k}: {v:.4f}")
@@ -384,8 +423,8 @@ def run_xgboost(config: dict, project_name: str):
         project_name: W&B project name
     """
 
-    data_config = config.get("data_config", {})
-    model_config = config.get("model_config", {})
+    data_config = config.get("data", {})
+    model_config = config.get("model", {})
     run = wandb.init(project=project_name, config=config)
     trainer, train_df, test_df = xgboost_training_setup(
         data_config=data_config,
@@ -440,7 +479,7 @@ def run_xgboost_tune(
     print(f"✓ Loaded {len(train_df)} samples with {len(train_df.columns)} features")
 
     def train_trial():
-        with wandb.init(project=project_name, config=config) as run:
+        with wandb.init(project=project_name, config=data_config) as run:
             # Use unified function
             train_and_evaluate_xgboost(
                 params=run.config,
@@ -463,6 +502,93 @@ def run_xgboost_tune(
     print("\n" + "=" * 80)
     print("SWEEP COMPLETE")
     print("=" * 80)
+
+
+################################################################
+######               Lasso Regression part                ######
+################################################################
+
+
+def run_lasso_regression(
+    config: dict,
+    sweep: bool = False,
+    sweep_config: dict = None,
+    project_name: str = None,
+    count: int = None,
+):
+    """
+    Train and evaluate a lasso regression model using sklearn, with optional W&B sweep.
+    """
+    import pandas as pd
+    from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+    from src.data_pipeline.dataset import ModularCellFeaturesDataset
+
+    # Load training data
+    data_config = config["data"]
+    model_config = config.get("model", {})
+    count = count or sweep_config.get("count", 10) if sweep and sweep_config else None
+    dataset = ModularCellFeaturesDataset(data_config=data_config)
+    train_df, test_df = dataset.split_train_test_set()
+    feature_names = [
+        column for column in train_df.columns.tolist() if not column.startswith("label_")
+    ]
+    X, y = dataset.split_X_y(train_df)
+    X_train, y_train, X_val, y_val = train_val_split(
+        X, y, split_ratio=config.get("train_val_split_ratio", 0.8), random_state=42
+    )
+
+    def train_trial(trial_config, wandb_run):
+        # Use config from sweep or default
+        params = trial_config
+        alpha = params.get("alpha", 1.0)
+        model = Lasso(alpha=alpha)
+        model.fit(X_train, y_train)
+        val_preds = model.predict(X_val) * dataset.fucci_scaler
+        train_preds = model.predict(X_train) * dataset.fucci_scaler
+        metrics = {}
+        train_metrics = evaluate_regression(
+            y_train * dataset.fucci_scaler,
+            train_preds,
+            prefix="train",
+            plot=False,
+            wandb_run=wandb_run,
+        )
+        metrics.update(train_metrics)
+        val_metrics = evaluate_regression(
+            y_val * dataset.fucci_scaler,
+            val_preds,
+            prefix="val",
+            plot=True,
+            wandb_run=wandb_run,
+        )
+        metrics.update(val_metrics)
+        importance = np.abs(model.coef_)
+        importance_df = pd.DataFrame(
+            data=importance,
+            columns=feature_names,
+            index=["488", "561"],
+        )
+        wandb.log({"feature_importance": wandb.Table(dataframe=importance_df)})
+        print("Lasso Regression Validation Results:")
+        print(f"MSE: {metrics['val_mse']:.4f}")
+        print(f"MAE: {metrics['val_mae']:.4f}")
+        print(f"R2: {metrics['val_r2']:.4f}")
+
+    if sweep and sweep_config is not None:
+        # W&B sweep
+        sweep_id = wandb.sweep(sweep=sweep_config, project=project_name)
+        print(f"Sweep initialized: {sweep_id}")
+        print("Starting sweep trials...")
+
+        def wandb_train():
+            with wandb.init(project=project_name, config=config) as run:
+                train_trial(run.config, wandb_run=run)
+
+        wandb.agent(sweep_id, function=wandb_train, count=count or 10, project=project_name)
+        print("SWEEP COMPLETE")
+    else:
+        wandb.init(project=project_name, config=config)
+        train_trial(trial_config=model_config, wandb_run=wandb.run)
 
 
 def main():
@@ -499,6 +625,18 @@ def main():
             # Run fit (which includes validation and test evaluation)
             project_name = args.project or "xgboost-cell-cycle"
             run_xgboost(config, project_name)
+    elif args.backend == "lasso":
+        if getattr(args, "tune", False):
+            sweep_config = load_config(args.sweep_config)
+            run_lasso_regression(
+                config,
+                sweep=True,
+                sweep_config=sweep_config,
+                project_name=args.project or "lasso-cell-cycle",
+                count=args.count,
+            )
+        else:
+            run_lasso_regression(config)
     else:
         raise ValueError(f"Unknown backend: {args.backend}")
 
