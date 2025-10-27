@@ -221,12 +221,8 @@ def create_model(model_config: Optional[Dict[str, Any]]):
         Initialized model
     """
 
-    if "model" in model_config and "init_args" in model_config:
-        params = {**model_config["init_args"]}
-        model = model_config["model"]
-    else:
-        params = {}
-        model = "CNet"
+    params = model_config["init_args"]
+    model = model_config["model"]
 
     model = MODELS[model](**params)
     return model
@@ -264,12 +260,20 @@ def run_lightning(config: Dict):
         log_model="all",
     )
 
-    # Create model and datamodule
-    model = create_model(model_config)
-
     datamodule = ModularCellDataModule(
         data_config_path=data_config_path,
     )
+
+    # Create model and datamodule
+    model_config["init_args"].update(
+        {
+            "fucci_scales": [
+                datamodule.scale_divider_488,
+                datamodule.scale_divider_561,
+            ]
+        }
+    )
+    model = create_model(model_config)
 
     # Configure trainer
     trainer = L.Trainer(

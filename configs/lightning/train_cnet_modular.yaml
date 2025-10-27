@@ -6,15 +6,19 @@ seed_everything: 42
 
 # Trainer configuration
 trainer:
+  experiment_name: cnet_cell_cycle
   default_root_dir: checkpoints/cnet/
   max_epochs: 150
   accelerator: auto
   devices: 1
   #gradient_clip_val: 1.0
+  #overfit_batches: 0.036
   log_every_n_steps: 10
   enable_checkpointing: true
   profiler: simple
   callbacks:
+    - class_path: src.train.callbacks.PlotCallback
+      init_args: {}
     - class_path: lightning.pytorch.callbacks.ModelSummary
       init_args:
         max_depth: -1  # Show all layers (default is 1)
@@ -36,7 +40,7 @@ trainer:
 
 # Model configuration
 model:
-  class_path: src.models.cnet.CNet
+  model: CNet
   init_args:
     in_channels: 6  # 2 channels × 3 planes = 6 total channels after stacking
     output_dim: 2
