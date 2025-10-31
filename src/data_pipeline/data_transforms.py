@@ -158,6 +158,98 @@ class FUCCIScaleTransform(ChannelTransform):
         }
 
 
+class CenterCellTransform(Transform):
+    """Center the cell in the image"""
+
+    def __init__(self, dimension: int = 250):
+        """
+        Args:
+            dimension: Target dimension to center the cell within
+        """
+        self.dimension = dimension
+
+    def __call__(self, data):
+        data = deepcopy(data)
+
+        # Get the segmentation mask to use
+        masks = data.segmentation
+
+        if not isinstance(masks, list):
+            masks = [masks]
+
+        rmin = self.dimension
+        rmax = 0
+        cmin = self.dimension
+        cmax = 0
+
+        for mask in masks:
+            # If mask is empty, skip
+            if np.sum(mask) < 10:
+                continue
+            # Find bounding box of non-zero regions
+            rows = np.any(mask, axis=1)
+            cols = np.any(mask, axis=0)
+
+            plane_rmin, plane_rmax = np.where(rows)[0][[0, -1]]
+            plane_cmin, plane_cmax = np.where(cols)[0][[0, -1]]
+
+            rmax = max(rmax, plane_rmax)
+            rmin = min(rmin, plane_rmin)
+            cmax = max(cmax, plane_cmax)
+            cmin = min(cmin, plane_cmin)
+
+        if rmax <= rmin or cmax <= cmin:
+            # No valid mask found, return original data
+            return data
+
+        # Center the cell in the image
+        for key in data.channels:
+            planes = data.channels[key]
+            if isinstance(planes, list):
+                data.channels[key] = [
+                    self._center_crop(plane, rmin, rmax, cmin, cmax) for plane in planes
+                ]
+            else:
+                data.channels[key] = [self._center_crop(planes, rmin, rmax, cmin, cmax)]
+
+        if data.segmentation is not None:
+            if isinstance(data.segmentation, list):
+                data.segmentation = [
+                    self._center_crop(plane, rmin, rmax, cmin, cmax) for plane in data.segmentation
+                ]
+            else:
+                data.segmentation = self._center_crop(data.segmentation, rmin, rmax, cmin, cmax)
+        if data.nuclei_segmentation is not None:
+            if isinstance(data.nuclei_segmentation, list):
+                data.nuclei_segmentation = [
+                    self._center_crop(plane, rmin, rmax, cmin, cmax)
+                    for plane in data.nuclei_segmentation
+                ]
+            else:
+                data.nuclei_segmentation = self._center_crop(
+                    data.nuclei_segmentation, rmin, rmax, cmin, cmax
+                )
+
+        return data
+
+    def _center_crop(
+        self, image: np.ndarray, rmin: int, rmax: int, cmin: int, cmax: int
+    ) -> np.ndarray:
+        centred_image = np.zeros((self.dimension, self.dimension), dtype=image.dtype)
+        c_begin = (self.dimension - (cmax - cmin)) // 2
+        r_begin = (self.dimension - (rmax - rmin)) // 2
+        centred_image[
+            r_begin : r_begin + (rmax - rmin) + 1, c_begin : c_begin + (cmax - cmin) + 1
+        ] = image[rmin : rmax + 1, cmin : cmax + 1]
+        return centred_image
+
+    def get_config(self) -> Dict[str, Any]:
+        return {
+            "type": "CenterCellTransform",
+            "dimension": self.dimension,
+        }
+
+
 class CropTransform(Transform):
     """Crop image to bounding box of segmentation mask"""
 
@@ -377,7 +469,7 @@ class SelectPlanesTransform(Transform):
             data.channels[channel_key] = selected
 
         # Also handle segmentation
-        if data.segmentation is not None and isinstance(data.segmentation, list):
+        if data.segmentation is not None:
             planes = data.segmentation
             if self.plane_selection == "middle":
                 data.segmentation = [planes[len(planes) // 2]]
@@ -386,7 +478,7 @@ class SelectPlanesTransform(Transform):
             elif self.plane_selection == "last":
                 data.segmentation = [planes[-1]]
 
-        if data.nuclei_segmentation is not None and isinstance(data.nuclei_segmentation, list):
+        if data.nuclei_segmentation is not None:
             planes = data.nuclei_segmentation
             if self.plane_selection == "middle":
                 data.nuclei_segmentation = [planes[len(planes) // 2]]

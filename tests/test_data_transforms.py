@@ -16,7 +16,88 @@ from src.data_pipeline.data_transforms import (
     TransformPipeline,
     FUCCIScaleTransform,
     RemoveBackgroundTransform,
+    CenterCellTransform,
 )
+
+
+class TestCenterCellTransform:
+    def test_features_unchanged_after_centering(self):
+        """Test that features from FeatureExtractor are unchanged after centering."""
+        from src.data_pipeline.feature_extractor import FeatureExtractor
+
+        # Create a simple cell mask and nucleus mask
+        mask = np.zeros((10, 10), dtype=np.uint8)
+        mask[2:7, 2:8] = 1
+        nucleus_mask = np.zeros((10, 10), dtype=np.uint8)
+        nucleus_mask[4:6, 4:8] = 1
+
+        # Channel with cell in same location
+        channel = np.zeros((10, 10), dtype=np.float32)
+        channel[2:7, 2:7] = 5.0
+
+        channels = {"405": [channel]}
+
+        # CellData expects segmentation and nuclei_segmentation
+        class DummyCellData:
+            def __init__(self):
+                self.cell_id = "test"
+                self.channels = channels
+                self.segmentation = [mask]
+                self.nuclei_segmentation = [nucleus_mask]
+                self.metadata = {"cell_id": "test"}
+
+        cell_data = DummyCellData()
+        extractor = FeatureExtractor()
+        features_before = extractor.extract_all_features(cell_data)
+
+        # Apply centering
+        transform = CenterCellTransform(dimension=10)
+        cell_data_centered = transform(cell_data)
+        features_after = extractor.extract_all_features(cell_data_centered)
+
+        # Features should be identical
+        assert features_before == features_after
+
+    """Test CenterCellTransform."""
+
+    def test_center_cell_basic(self):
+        """Test centering a cell in the image."""
+        transform = CenterCellTransform(dimension=10)
+
+        # Create a mask with a cell in the top-left corner
+        mask = np.zeros((10, 10), dtype=np.uint8)
+        mask[1:5, 1:4] = 1
+
+        # Channel with cell in same location
+        channel = np.zeros((10, 10), dtype=np.float32)
+        channel[1:5, 1:4] = 5.0
+
+        channels = {"488": [channel]}
+        cell_data = CellData(cell_id="test", channels=channels, segmentation=[mask])
+
+        result = transform(cell_data)
+
+        # The cell should now be centered in the output
+        centered_channel = result.channels["488"][0]
+        # Find where the cell is now
+        cell_indices = np.argwhere(centered_channel == 5.0)
+        # Should be centered around the middle
+        assert np.all((cell_indices >= 3) & (cell_indices <= 6))
+
+    def test_center_cell_empty_mask(self):
+        """Test centering with an empty mask (should not move cell)."""
+        transform = CenterCellTransform(dimension=10)
+
+        mask = np.zeros((10, 10), dtype=np.uint8)
+        channel = np.ones((10, 10), dtype=np.float32)
+        channels = {"488": [channel]}
+        cell_data = CellData(cell_id="test", channels=channels, segmentation=[mask])
+
+        result = transform(cell_data)
+        # Should remain unchanged since mask is empty
+        assert np.allclose(result.channels["488"][0], channel)
+
+
 from src.data_pipeline.data_sources import CellData
 
 
