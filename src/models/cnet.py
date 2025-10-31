@@ -2,13 +2,16 @@
 CNet - Convolutional Neural Network for Cell Image FUCCI Intensity Regression
 """
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import lightning as L
 from torch.optim import Adam, AdamW, SGD
 from torch.optim.lr_scheduler import ReduceLROnPlateau, CosineAnnealingLR, StepLR
+from torcheval.metrics import R2Score
 from typing import Optional, Dict, Any, List, Tuple
+from src.train.utils import log_plot
 
 
 class ConvBlock(nn.Module):
@@ -82,6 +85,15 @@ class CNet(L.LightningModule):
         self.scheduler_name = scheduler
         self.weight_decay = weight_decay
 
+        self.train_residuals = []
+        self.train_predictions = []
+        self.train_targets = []
+        self.val_residuals = []
+        self.val_predictions = []
+        self.val_targets = []
+        self.val_r2_score = R2Score()
+        self.test_r2_score = R2Score()
+
         # Build convolutional blocks
         self.conv_blocks = nn.ModuleList()
         current_channels = in_channels
@@ -112,7 +124,7 @@ class CNet(L.LightningModule):
                 [
                     nn.Linear(fc_input_dim, hidden_dim),
                     nn.ReLU(inplace=True),
-                    nn.Dropout(dropout),
+                    # nn.Dropout(dropout),
                 ]
             )
             fc_input_dim = hidden_dim
@@ -151,47 +163,94 @@ class CNet(L.LightningModule):
 
         return x
 
-    def _shared_step(self, batch, batch_idx, stage: str):
-        """Shared step for train/val/test"""
-        x, y = batch
-
-        # Forward pass
-        predictions = self(x)
-        loss = self.criterion(predictions, y)
-
-        # Log metrics
-        self.log(f"{stage}_loss", loss, prog_bar=True, on_step=False, on_epoch=True)
-
-        mae = F.l1_loss(predictions, y)
-        self.log(f"{stage}_mae", mae, prog_bar=True, on_step=False, on_epoch=True)
-        return {"loss": loss, "predictions": predictions, "targets": y, "mae": mae}
-
     def training_step(self, batch, batch_idx):
         """Training step"""
         x, y = batch
 
         # Forward pass
         predictions = self(x)
-
         loss = self.criterion(predictions, y)
+
         mae = F.l1_loss(predictions, y)
+        mse = F.mse_loss(predictions, y)
+
+        self.train_predictions.append(predictions.detach().cpu().numpy())
+        self.train_targets.append(y.detach().cpu().numpy())
         # Log metrics
-        self.log("train_loss", loss, prog_bar=True, on_step=True, on_epoch=True)
-        self.log("train_mae", mae, prog_bar=False)
+        self.log(f"train_loss", loss, prog_bar=True, on_step=True, on_epoch=True)
+        self.log(f"train_mae", mae, prog_bar=False, on_step=True, on_epoch=True)
+        self.log(f"train_mse", mse, prog_bar=False, on_step=True, on_epoch=True)
 
         return loss
 
     def validation_step(self, batch, batch_idx):
         """Validation step"""
-        output = self._shared_step(batch, batch_idx, "val")
+        x, y = batch
 
-        return output
+        # Forward pass
+        predictions = self(x)
+        loss = self.criterion(predictions, y)
+
+        mae = F.l1_loss(predictions, y)
+        mse = F.mse_loss(predictions, y)
+
+        # Log metrics
+        self.log(f"val_loss", loss, prog_bar=True, on_step=False, on_epoch=True)
+        self.log(f"val_mae", mae, prog_bar=False, on_step=False, on_epoch=True)
+        self.log(f"val_mse", mse, prog_bar=False, on_step=False, on_epoch=True)
+        print(
+            f"Validation Step Batch {batch_idx}: Loss={loss.item()}, MAE={mae.item()}, MSE={mse.item()}"
+        )
+        if batch_idx == 0:
+            self.val_r2_score.reset()
+        self.val_r2_score.update(predictions, y)
+
+        self.val_predictions.append(predictions.detach().cpu().numpy())
+        self.val_targets.append(y.detach().cpu().numpy())
+
+        return loss
+
+    def on_validation_epoch_end(self):
+        """Called at the end of validation epoch"""
+        val_r2 = self.val_r2_score.compute()
+        if not self.trainer.sanity_checking:
+            self.logger.experiment.log({"val_r2": val_r2})
+        print(f"Validation Epoch End: R2={val_r2}")
+        self.val_r2_score.reset()
+        super().on_validation_epoch_end()
+        return val_r2
 
     def test_step(self, batch, batch_idx):
         """Test step"""
-        output = self._shared_step(batch, batch_idx, "test")
+        x, y = batch
 
-        return output
+        # Forward pass
+        predictions = self(x)
+        loss = self.criterion(predictions, y)
+
+        mae = F.l1_loss(predictions, y)
+        mse = F.mse_loss(predictions, y)
+
+        # Log metrics
+        self.log(f"test_loss", loss, prog_bar=True, on_step=False, on_epoch=True)
+        self.log(f"test_mae", mae, prog_bar=False, on_step=False, on_epoch=True)
+        self.log(f"test_mse", mse, prog_bar=False, on_step=False, on_epoch=True)
+
+        if batch_idx == 0:
+            self.test_r2_score.reset()
+        self.test_r2_score.update(predictions, y)
+
+        return loss
+
+    def on_test_end(self):
+        """Called at the end of test epoch"""
+        test_r2 = self.test_r2_score.compute()
+        if not self.trainer.sanity_checking:
+            self.logger.experiment.log({"test_r2": test_r2})
+        print(f"Test Epoch End: R2={test_r2}")
+        self.test_r2_score.reset()
+        super().on_test_epoch_end()
+        return test_r2
 
     def predict_step(self, batch, batch_idx):
         """Prediction step"""
