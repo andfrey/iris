@@ -1,0 +1,13 @@
+project: cell_cycle_lasso_sweep
+count: 20
+method: bayes  # Options: grid, random, bayes
+metric:
+  name: val_mse
+  goal: minimize
+
+parameters:
+  # Regularization strength
+  alpha:
+    distribution: log_uniform_values
+    min: 0.0001
+    max: 10.0

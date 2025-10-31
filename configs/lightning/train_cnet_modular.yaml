@@ -14,10 +14,6 @@ trainer:
   log_every_n_steps: 10
   enable_checkpointing: true
   profiler: simple
-  logger:
-    class_path: lightning.pytorch.loggers.MLFlowLogger
-    init_args:
-      experiment_name: convnet_experiments
   callbacks:
     - class_path: lightning.pytorch.callbacks.ModelSummary
       init_args:
@@ -52,4 +48,4 @@ model:
     scheduler: cosine
 
 data:
-  data_config_path: "configs/data_config.yaml"
+  data_config_path: "configs/lightning/data_config.yaml"

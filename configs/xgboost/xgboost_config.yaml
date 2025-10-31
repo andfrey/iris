@@ -1,0 +1,62 @@
+model:
+  # XGBoost Model Configuration
+
+  # Default XGBoost hyperparameters (used for single fit runs)
+  # Learning rate (eta)
+  learning_rate: 0.035376
+
+  # Maximum tree depth
+  max_depth: 3
+
+  # Number of boosting rounds
+  n_estimators: 300
+
+  # Subsample ratio of training instances
+  subsample: 0.89234
+
+  # Subsample ratio of columns when constructing each tree
+  colsample_bytree: 0.70208
+
+  # Minimum sum of instance weight needed in a child
+  min_child_weight: 1
+
+  # L2 regularization term on weights
+  reg_lambda: 3.5
+
+  # L1 regularization term on weights
+  reg_alpha: 0.0
+
+  # Minimum loss reduction required to make a further partition
+  gamma: 0.0041141
+
+  # Random seed
+  random_state: 42
+
+data:
+  # Data source
+  h5_path: /myhome/iris/data/fucci_3t3_221124_filtered_noNG030JP208_with_nuclei_seg.h5
+
+  # DataLoader settings
+  batch_size: 64
+  num_workers: 0  # Use 0 for A100 to avoid shared memory issues
+
+  # Train/test split ratio
+  train: 0.9  # Train, Val, Test splits
+  train_val_split_ratio: 0.8
+  seed: 42
+
+  # Quality filters
+  use_quality_filters: true
+  plane_count: 3
+  max_objects: 1
+  min_seg_pixels: 10
+  max_nuclei_outside_ratio: 0.2
+  force_refilter: false  # Use cached results if available
+
+  fucci_scale_transform:
+    scale_divider_488: 16464.0
+    scale_divider_561: 31173.0
+
+  feature_transform_config:
+   - class_path: sklearn.preprocessing.StandardScaler
+     init_args: {}

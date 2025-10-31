@@ -1,0 +1,58 @@
+# W&B Sweep configuration for XGBoost hyperparameter tuning
+# See: https://docs.wandb.ai/guides/sweeps/configuration
+
+project: cell_cycle_xgboost_seep
+count: 150
+method: bayes  # Options: grid, random, bayes
+metric:
+  name: val_mse
+  goal: minimize
+
+parameters:
+  # Learning rate
+  learning_rate:
+    distribution: log_uniform_values
+    min: 0.001
+    max: 0.3
+
+  # Tree depth
+  max_depth:
+    values: [3, 4, 5, 6, 7, 8, 9, 10]
+
+  # Number of boosting rounds
+  n_estimators:
+    values: [20, 30, 50, 80, 100, 150, 200, 300, 400]
+
+  # Subsample ratio of training instances
+  subsample:
+    distribution: uniform
+    min: 0.5
+    max: 1.0
+
+  # Subsample ratio of columns when constructing each tree
+  colsample_bytree:
+    distribution: uniform
+    min: 0.5
+    max: 1.0
+
+  # Minimum sum of instance weight needed in a child
+  min_child_weight:
+    values: [1, 3, 5, 7]
+
+  # L2 regularization term on weights
+  reg_lambda:
+    distribution: log_uniform_values
+    min: 0.001
+    max: 10.0
+
+  # L1 regularization term on weights
+  reg_alpha:
+    distribution: log_uniform_values
+    min: 0.0001
+    max: 1.0
+
+  # Gamma (minimum loss reduction required to make a split)
+  gamma:
+    distribution: uniform
+    min: 0.0
+    max: 5.0

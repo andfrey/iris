@@ -1,0 +1,35 @@
+model:
+  # LASSO Regression Model Configuration
+
+  # Default LASSO hyperparameters (used for single fit runs)
+  # Regularization strength
+  alpha: 1.0
+
+data:
+  # Data source
+  h5_path: /myhome/iris/data/fucci_3t3_221124_filtered_noNG030JP208_with_nuclei_seg.h5
+
+  # DataLoader settings
+  batch_size: 64
+  num_workers: 0  # Use 0 for A100 to avoid shared memory issues
+
+  # Train/test split ratio
+  train: 0.9  # Train, Val, Test splits
+  train_val_split_ratio: 0.8
+  seed: 42
+
+  # Quality filters
+  use_quality_filters: true
+  plane_count: 3
+  max_objects: 1
+  min_seg_pixels: 10
+  max_nuclei_outside_ratio: 0.2
+  force_refilter: false  # Use cached results if available
+
+  fucci_scale_transform:
+    scale_divider_488: 16464.0
+    scale_divider_561: 31173.0
+
+  feature_transform_config:
+   - class_path: sklearn.preprocessing.StandardScaler
+     init_args: {}
