@@ -33,6 +33,7 @@ import yaml
 from pathlib import Path
 from typing import Optional, Dict, Any
 import numpy as np
+from datetime import datetime
 
 # Load environment variables from .env file
 try:
@@ -55,7 +56,7 @@ from lightning.pytorch.callbacks import (
     DeviceStatsMonitor,
 )
 from lightning.pytorch.loggers import WandbLogger
-from sklearn.linear_model import Lasso
+from sklearn.linear_model import Lasso, Ridge
 import wandb
 
 
@@ -76,7 +77,8 @@ FILE_DIR_PATH = Path(__file__).resolve().parent
 
 MODELS = {
     "CNet": CNet,
-    "lasso": Lasso,
+    "Ridge": Ridge,
+    "Lasso": Lasso,
 }
 
 
@@ -103,6 +105,18 @@ def parse_args():
         required=True,
         help="Path to the train config YAML file",
     )
+    common_parser.add_argument(
+        "--project",
+        type=str,
+        default=None,
+        help="W&B project name",
+    )
+    common_parser.add_argument(
+        "--experiment-name",
+        type=str,
+        default=None,
+        help="Experiment name",
+    )
 
     # Lightning backend
     lightning_parser = subparsers.add_parser(
@@ -118,34 +132,42 @@ def parse_args():
         help="Train with XGBoost and evaluate on validation/test sets",
     )
 
-    # Lasso regression backend
-    lasso_parser = subparsers.add_parser(
-        "lasso",
+    # Linear regression backend
+    linear_parser = subparsers.add_parser(
+        "linear",
         parents=[common_parser],
-        help="Train with Lasso Regression (sklearn) and evaluate on validation/test sets",
+        help="Train with Linear Regression (sklearn) and evaluate on validation/test sets",
     )
-    lasso_parser.add_argument(
+
+    # Experiment backend
+    dataset_size_experiment = subparsers.add_parser(
+        "dataset_size_experiment",
+        parents=[common_parser],
+        help="Run dataset size experiment",
+    )
+    dataset_size_experiment.add_argument(
+        "--steps",
+        type=int,
+        default=2000,
+        help="Step size for increasing dataset size in the experiment",
+    )
+
+    linear_parser.add_argument(
         "--tune",
         action="store_true",
         help="Run hyperparameter sweep with W&B instead of single training run",
     )
-    lasso_parser.add_argument(
+    linear_parser.add_argument(
         "--sweep-config",
         type=str,
         default=None,
         help="Path to W&B sweep configuration YAML (used with --tune)",
     )
-    lasso_parser.add_argument(
+    linear_parser.add_argument(
         "--count",
         type=int,
         default=None,
         help="Number of sweep trials to run (used with --tune, default: run until stopped)",
-    )
-    lasso_parser.add_argument(
-        "--project",
-        type=str,
-        default=None,
-        help="W&B project name",
     )
 
     # Add tune flag for XGBoost hyperparameter sweep
@@ -165,12 +187,6 @@ def parse_args():
         type=int,
         default=None,
         help="Number of sweep trials to run (used with --tune, default: run until stopped)",
-    )
-    xgb_parser.add_argument(
-        "--project",
-        type=str,
-        default=None,
-        help="W&B project name",
     )
 
     return parser.parse_args()
@@ -228,7 +244,46 @@ def create_model(model_config: Optional[Dict[str, Any]]):
     return model
 
 
-def run_lightning(config: Dict):
+def run_dataset_size_experiment(config, steps):
+    """
+    Run experiments to evaluate the effect of dataset size on model performance.
+
+    Args:
+        config: Configuration dictionary
+        experiment_name: Name of the experiment for logging
+    """
+    data_config = config.get("data")
+    trainer_config = config.get("trainer")
+    datamodule = ModularCellDataModule(
+        data_config_path=data_config.get("data_config_path"),
+    )
+    datamodule.setup()
+    len_dataset = len(datamodule.train_dataset)
+    nr_dataset_batches = len(datamodule.train_dataloader())
+    for dataset_size in range(steps, len_dataset, steps):
+        print("\n" + "=" * 80)
+        print(f"Running experiment with dataset size: {dataset_size}")
+        print("=" * 80 + "\n")
+        # Here you would implement the logic to train and evaluate the model
+        # using only 'dataset_size' number of samples from the training set.
+        # This function can be expanded based on specific experiment requirements.
+        nr_batches = dataset_size // datamodule.batch_size
+        dataset_batch_fraction = nr_batches / nr_dataset_batches
+        print(f"Using {nr_batches} batches ({dataset_batch_fraction:.2%} of full dataset)")
+        # Example: You might want to modify the datamodule or dataloader
+        data_config.update({"train_dataset_size": dataset_size})
+        trainer_config.update({"overfit_batches": dataset_batch_fraction})
+        run_lightning(
+            config,
+            experiment_name=f"dataset_size_{dataset_size}",
+        )
+
+    # This function can be implemented to run experiments varying dataset sizes
+
+
+def run_lightning(
+    config: Dict, experiment_name: Optional[str] = None, project_name: Optional[str] = None
+):
     """
     Run Lightning training with automatic validation and test evaluation.
 
@@ -243,8 +298,9 @@ def run_lightning(config: Dict):
     print("=" * 80 + "\n")
 
     seed = trainer_config.get("seed", 42)
-    experiment_name = trainer_config.get("experiment_name", "default_experiment")
-
+    project_name = project_name or config.get("project_name", None)
+    experiment_name = experiment_name or config.get("experiment_name", "experiment")
+    experiment_name = experiment_name + "-" + datetime.now().strftime("%Y%m%d-%H%M%S")
     # Set seed for reproducibility
     L.seed_everything(seed, workers=True)
 
@@ -256,23 +312,16 @@ def run_lightning(config: Dict):
 
     # Initialize logger
     logger = WandbLogger(
-        project=experiment_name,
+        project=project_name,
         log_model="all",
+        name=experiment_name,
+        save_dir=f"lightning_logs/{experiment_name}",
     )
 
     datamodule = ModularCellDataModule(
         data_config_path=data_config_path,
     )
 
-    # Create model and datamodule
-    model_config["init_args"].update(
-        {
-            "fucci_scales": [
-                datamodule.scale_divider_488,
-                datamodule.scale_divider_561,
-            ]
-        }
-    )
     model = create_model(model_config)
 
     # Configure trainer
@@ -339,7 +388,6 @@ def xgboost_training_setup(
 
     dataset = ModularCellFeaturesDataset(data_config=data_config)
     train_df, test_df = dataset.split_train_test_set()
-    fucci_scalers = dataset.fucci_scaler
     # Allow override
     train_val_split_ratio = data_config.get("train_val_split_ratio", 0.8)
 
@@ -347,7 +395,6 @@ def xgboost_training_setup(
         training_data=train_df,
         wandb_run=wandb_run,
         train_val_split_ratio=train_val_split_ratio,
-        fucci_scalers=fucci_scalers,
     )
     return trainer, train_df, test_df
 
@@ -393,8 +440,8 @@ def train_and_evaluate_xgboost(
     if test_df is not None:
         test_X, test_y = ModularCellFeaturesDataset.split_X_y(test_df)
         test_metrics = evaluate_regression(
-            test_y * trainer.fucci_scalers,
-            model.predict(test_X) * trainer.fucci_scalers,
+            test_y,
+            model.predict(test_X),
             prefix="test",
             plot=False,
             wandb_run=wandb_run,
@@ -509,11 +556,11 @@ def run_xgboost_tune(
 
 
 ################################################################
-######               Lasso Regression part                ######
+######               Linear Regression part                ######
 ################################################################
 
 
-def run_lasso_regression(
+def run_linear_regression(
     config: dict,
     sweep: bool = False,
     sweep_config: dict = None,
@@ -530,6 +577,9 @@ def run_lasso_regression(
     # Load training data
     data_config = config["data"]
     model_config = config.get("model", {})
+    model_name = config.get("model_name")
+    model = MODELS[model_name]
+
     count = count or sweep_config.get("count", 10) if sweep and sweep_config else None
     dataset = ModularCellFeaturesDataset(data_config=data_config)
     train_df, test_df = dataset.split_train_test_set()
@@ -541,17 +591,18 @@ def run_lasso_regression(
         X, y, split_ratio=config.get("train_val_split_ratio", 0.8), random_state=42
     )
 
-    def train_trial(trial_config, wandb_run):
+    def train_trial(trial_config, wandb_run, model=model):
         # Use config from sweep or default
         params = trial_config
-        alpha = params.get("alpha", 1.0)
-        model = Lasso(alpha=alpha)
+        alpha = params.get("alpha")
+        model = model(alpha=alpha)
         model.fit(X_train, y_train)
-        val_preds = model.predict(X_val) * dataset.fucci_scaler
-        train_preds = model.predict(X_train) * dataset.fucci_scaler
+        print("Model:", model)
+        val_preds = model.predict(X_val)
+        train_preds = model.predict(X_train)
         metrics = {}
         train_metrics = evaluate_regression(
-            y_train * dataset.fucci_scaler,
+            y_train,
             train_preds,
             prefix="train",
             plot=False,
@@ -559,7 +610,7 @@ def run_lasso_regression(
         )
         metrics.update(train_metrics)
         val_metrics = evaluate_regression(
-            y_val * dataset.fucci_scaler,
+            y_val,
             val_preds,
             prefix="val",
             plot=True,
@@ -573,26 +624,27 @@ def run_lasso_regression(
             index=["488", "561"],
         )
         wandb.log({"feature_importance": wandb.Table(dataframe=importance_df)})
-        print("Lasso Regression Validation Results:")
+        print(f"{model_name} Regression Validation Results:")
         print(f"MSE: {metrics['val_mse']:.4f}")
         print(f"MAE: {metrics['val_mae']:.4f}")
         print(f"R2: {metrics['val_r2']:.4f}")
 
     if sweep and sweep_config is not None:
         # W&B sweep
+        project_name = sweep_config.get("project") or project_name
         sweep_id = wandb.sweep(sweep=sweep_config, project=project_name)
         print(f"Sweep initialized: {sweep_id}")
         print("Starting sweep trials...")
 
         def wandb_train():
-            with wandb.init(project=project_name, config=config) as run:
-                train_trial(run.config, wandb_run=run)
+            with wandb.init(project=project_name, config=data_config) as run:
+                train_trial(run.config, wandb_run=run, model=model)
 
         wandb.agent(sweep_id, function=wandb_train, count=count or 10, project=project_name)
         print("SWEEP COMPLETE")
     else:
         wandb.init(project=project_name, config=config)
-        train_trial(trial_config=model_config, wandb_run=wandb.run)
+        train_trial(trial_config=model_config, wandb_run=wandb.run, model=model)
 
 
 def main():
@@ -613,8 +665,11 @@ def main():
     print("=" * 80 + "\n")
 
     config = load_config(args.config)
+
+    project_name = args.project
+    experiment_name = args.experiment_name
     if args.backend == "lightning":
-        run_lightning(config)
+        run_lightning(config, project_name=project_name, experiment_name=experiment_name)
     elif args.backend == "xgboost":
         if args.tune:
             # Run hyperparameter sweep
@@ -627,20 +682,22 @@ def main():
             )
         else:
             # Run fit (which includes validation and test evaluation)
-            project_name = args.project or "xgboost-cell-cycle"
             run_xgboost(config, project_name)
-    elif args.backend == "lasso":
+    elif args.backend == "linear":
         if getattr(args, "tune", False):
             sweep_config = load_config(args.sweep_config)
-            run_lasso_regression(
+            run_linear_regression(
                 config,
                 sweep=True,
                 sweep_config=sweep_config,
-                project_name=args.project or "lasso-cell-cycle",
+                project_name=args.project or "linear-cell-cycle",
                 count=args.count,
             )
         else:
-            run_lasso_regression(config)
+            run_linear_regression(config)
+    elif args.backend == "dataset_size_experiment":
+        run_dataset_size_experiment(config, steps=args.steps)
+
     else:
         raise ValueError(f"Unknown backend: {args.backend}")
 
