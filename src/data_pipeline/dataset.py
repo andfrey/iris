@@ -33,17 +33,19 @@ class BaseCellDataset(Dataset):
         transform: Optional[Transform] = None,
         mask_intensity: str = "segmentation",
         debug: bool = False,
-        scale_divider_488: float = 1.0,
-        scale_divider_561: float = 1.0,
+        fucci_transform: dict = {},
     ):
         self.data_source = data_source
         self.transform = transform
         self.mask_intensity = mask_intensity
         self.debug = debug
-        self.scale_divider_488 = scale_divider_488
-        self.scale_divider_561 = scale_divider_561
-        print(f"✓ Scale dividers: 488={self.scale_divider_488}, 561={self.scale_divider_561}")
-        self.fucci_scaler = np.array([self.scale_divider_488, self.scale_divider_561])
+        self.fucci_transform = fucci_transform
+        if "scale" in fucci_transform:
+            self.scale_divider_488 = fucci_transform.get("scale_divider_488", 1.0)
+            self.scale_divider_561 = fucci_transform.get("scale_divider_561", 1.0)
+            self.fucci_scaler = np.array([self.scale_divider_488, self.scale_divider_561])
+            print(f"✓ Scale dividers: 488={self.scale_divider_488}, 561={self.scale_divider_561}")
+
         self.cell_ids = data_source.get_cell_ids()
         print(f"✓ Dataset initialized with {len(self.cell_ids):,} cells")
 
@@ -61,7 +63,15 @@ class BaseCellDataset(Dataset):
         labels = compute_fucci_labels(
             cell_data, mask_intensity=self.mask_intensity, debug=self.debug
         )
-        labels = labels / self.fucci_scaler
+        if "scale" in self.fucci_transform:
+            labels = labels / self.fucci_scaler
+        elif "log" in self.fucci_transform:
+            # to avoid log(0) and log of negative values
+            if labels[0] <= 1e-6:
+                labels[0] = 1e-6
+            if labels[1] <= 1e-6:
+                labels[1] = 1e-6
+            labels = np.log(labels)
         return labels
 
 
@@ -93,7 +103,7 @@ class ModularCellDataModule(L.LightningDataModule):
 
     def __init__(
         self,
-        data_config_path: str = "configs/data_config.yaml",
+        data_config_path: str,
     ):
         """
         Args:
@@ -139,20 +149,6 @@ class ModularCellDataModule(L.LightningDataModule):
         self.data_split = self.config.get("data_split", [0.7, 0.2, 0.1])
         self.seed = self.config.get("seed", 42)  # For reproducibility
 
-        if self.config.get("fucci_scale_transform", None) is not None:
-            if (
-                not "scale_divider_488" in self.config["fucci_scale_transform"]
-                or not "scale_divider_561" in self.config["fucci_scale_transform"]
-            ):
-                raise ValueError(
-                    "fucci_scale_transform requires 'scale_divider_488' and 'scale_divider_561' in data_config"
-                )
-            self.scale_divider_488 = self.config["fucci_scale_transform"]["scale_divider_488"]
-            self.scale_divider_561 = self.config["fucci_scale_transform"]["scale_divider_561"]
-        else:
-            self.scale_divider_488 = 1.0
-            self.scale_divider_561 = 1.0
-
         # Datasets (initialized in setup)
         self.train_dataset = None
         self.val_dataset = None
@@ -193,8 +189,8 @@ class ModularCellDataModule(L.LightningDataModule):
         self.full_dataset = ModularCellImageDataset(
             data_source=data_source,
             transform=transform_pipeline,
-            scale_divider_488=self.scale_divider_488,
-            scale_divider_561=self.scale_divider_561,
+            fucci_transform=self.config.get("fucci_transform", {}),
+            input_channels=self.config.get("input_channels", ["405", "bf"]),
         )
 
         # 5. Split into train/val
@@ -263,12 +259,25 @@ class ModularCellImageDataset(BaseCellDataset):
     Generic cell image dataset that works with any DataSource and Transform pipeline.
     """
 
+    def __init__(self, input_channels=["bf", "405"], **kwargs):
+        self.input_channels = input_channels
+        super().__init__(**kwargs)
+
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
         cell_data = self.get_cell_data(idx)
         labels = self.compute_labels(cell_data)
         channel_list = []
-        for channel_name in ["bf", "405"]:
-            for plane in cell_data.channels.get(channel_name, None):
+        for channel_name in self.input_channels:
+            if channel_name not in cell_data.channels:
+                if getattr(cell_data, channel_name, None):
+                    planes = getattr(cell_data, channel_name)
+                else:
+                    raise ValueError(
+                        f"Channel {channel_name} not found for cell {self.cell_ids[idx]}"
+                    )
+            else:
+                planes = cell_data.channels[channel_name]
+            for plane in planes:
                 if plane is None:
                     raise ValueError(
                         f"Missing channel {channel_name} for cell {self.cell_ids[idx]}"
@@ -312,12 +321,7 @@ class ModularCellFeaturesDataset(BaseCellDataset):
             transform=self.image_transform,
             mask_intensity=mask_intensity,
             debug=debug,
-            scale_divider_488=self.config.get("fucci_scale_transform", {}).get(
-                "scale_divider_488", 1.0
-            ),
-            scale_divider_561=self.config.get("fucci_scale_transform", {}).get(
-                "scale_divider_561", 1.0
-            ),
+            fucci_transform=self.config.get("fucci_transform", {}),
         )
         self.feature_extractor = FeatureExtractor()
         self.df = None
@@ -330,11 +334,8 @@ class ModularCellFeaturesDataset(BaseCellDataset):
             "image_transform_config": (
                 self.image_transform.get_config() if self.image_transform else None
             ),
-            "fucci_scale_transform": {
-                "scale_divider_488": self.scale_divider_488,
-                "scale_divider_561": self.scale_divider_561,
-            },
         }
+        cache_params.update(self.config.get("fucci_transform", {}))
         cache_hash = make_hash_from_dict(cache_params, length=12)
         return f"features_{cache_hash}"
 
