@@ -20,7 +20,7 @@ class PlotCallback(Callback):
         pl_module.val_predictions = []
         pl_module.val_targets = []
 
-    def on_train_epoch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+    def on_train_epoch_end(self, trainer, pl_module):
         log_regression_plots(
             np.concat(pl_module.train_targets, axis=0),
             np.concat(pl_module.train_predictions, axis=0),
@@ -38,6 +38,8 @@ class DebugCallback(Callback):
 
         batch = next(iter(trainer.datamodule.train_dataloader()))
         X, y = batch
+        if isinstance(X, list) or isinstance(X, tuple):
+            X = X[0]
         batch_size = X.shape[0]
         channel_length = X.shape[1]
         fig, axes = plt.subplots(min(10, batch_size), min(10, channel_length), figsize=(12, 8))
@@ -47,3 +49,11 @@ class DebugCallback(Callback):
                 ax[j].axis("off")
         trainer.logger.experiment.log({"sanity_check_images": wandb.Image(plt)})
         plt.close(fig)
+        if len(y.shape) == 1 or y.shape[1] == 1:
+            projector = trainer.datamodule.full_dataset.projector
+            if projector is not None:
+                curve_values = projector.point_at_phase(y.squeeze().cpu().numpy())
+                ax = projector.plot_curve(show=False)
+                ax.scatter(curve_values[:, 0], curve_values[:, 1], c="blue", s=30, marker="o")
+                trainer.logger.experiment.log({"sanity_check_curve": wandb.Image(plt)})
+                plt.close()

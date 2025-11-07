@@ -5,9 +5,11 @@ Unified training script for cell cycle prediction using PyTorch Lightning or XGB
 This script provides full control over training, validation, and hyperparameter tuning for both Lightning and XGBoost backends, with explicit callback and logger initialization. XGBoost training and sweep logic is unified to avoid code duplication.
 
 Usage:
-    # Train with PyTorch Lightning
+    # Train with PyTorch Lightning (e.g., CNet or MLP)
     python src/train/train.py lightning \
         --config configs/lightning_config.yaml
+
+    # To use the MLP model, set model.model: "MLP" and ensure your data config has add_features: true
 
     # Train with XGBoost
     python src/train/train.py xgboost \
@@ -64,9 +66,14 @@ import wandb
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from src.models.cnet import CNet
+from src.models.mlp import MLP
 from src.train.utils import evaluate_regression, train_val_split
 from src.models.xgboost_trainer import XGBoostCellCycleTrainer
-from src.data_pipeline.dataset import ModularCellDataModule, ModularCellFeaturesDataset
+from src.data_pipeline.dataset import (
+    ModularCellDataModule,
+    ModularCellFeaturesDataset,
+    ModularCellImageFeatureDataset,
+)
 
 # Set matmul precision for Tensor Cores
 matmul_precision = os.getenv("MATMUL_PRECISION", "high")
@@ -77,6 +84,7 @@ FILE_DIR_PATH = Path(__file__).resolve().parent
 
 MODELS = {
     "CNet": CNet,
+    "MLP": MLP,
     "Ridge": Ridge,
     "Lasso": Lasso,
 }
@@ -324,6 +332,15 @@ def run_lightning(
 
     model = create_model(model_config)
 
+    # If training MLP, ensure the datamodule is configured to provide features
+    if isinstance(model, MLP):
+        # Setup minimally to know dataset type without building loaders twice
+        datamodule.setup()
+        if not isinstance(datamodule.full_dataset, ModularCellImageFeatureDataset):
+            print(
+                "⚠ MLP expects feature inputs. Set `add_features: true` in your data config so the datamodule returns (images, features)."
+            )
+
     # Configure trainer
     trainer = L.Trainer(
         **trainer_config,
@@ -387,16 +404,13 @@ def xgboost_training_setup(
     """
 
     dataset = ModularCellFeaturesDataset(data_config=data_config)
-    train_df, test_df = dataset.split_train_test_set()
-    # Allow override
-    train_val_split_ratio = data_config.get("train_val_split_ratio", 0.8)
+
+    train_df, test_df, val_df = dataset.split_set()
 
     trainer = XGBoostCellCycleTrainer(
-        training_data=train_df,
-        wandb_run=wandb_run,
-        train_val_split_ratio=train_val_split_ratio,
+        training_data=train_df, val_data=val_df, wandb_run=wandb_run, dataset=dataset
     )
-    return trainer, train_df, test_df
+    return trainer, test_df, dataset
 
 
 def train_and_evaluate_xgboost(
@@ -405,7 +419,8 @@ def train_and_evaluate_xgboost(
     wandb_run: wandb.sdk.wandb_run.Run,
     model_suffix: str = "",
     save_model: bool = True,
-    test_df=None,
+    test_X=None,
+    test_y=None,
 ):
     """
     Unified XGBoost training and evaluation logic for both normal and sweep modes.
@@ -436,12 +451,10 @@ def train_and_evaluate_xgboost(
         os.makedirs(os.path.dirname(model_path), exist_ok=True)
         trainer.save_model(model_path)
 
-    test_X, test_y = None, None
-    if test_df is not None:
-        test_X, test_y = ModularCellFeaturesDataset.split_X_y(test_df)
+    if test_X is not None and test_y is not None:
         test_metrics = evaluate_regression(
             test_y,
-            model.predict(test_X),
+            trainer.predict(test_X),
             prefix="test",
             plot=False,
             wandb_run=wandb_run,
@@ -477,13 +490,15 @@ def run_xgboost(config: dict, project_name: str):
     data_config = config.get("data", {})
     model_config = config.get("model", {})
     run = wandb.init(project=project_name, config=config)
-    trainer, train_df, test_df = xgboost_training_setup(
+    trainer, test_df, dataset = xgboost_training_setup(
         data_config=data_config,
     )
+    test_X, test_y = dataset.split_X_y(test_df)
     train_and_evaluate_xgboost(
         params=model_config,
         trainer=trainer,
-        test_df=test_df,
+        test_X=test_X,
+        test_y=test_y,
         wandb_run=run,
         save_model=True,
         model_suffix=f"_sweep_{run.id}",
@@ -524,10 +539,10 @@ def run_xgboost_tune(
     print("Loading data (will be reused across trials)...")
     data_config = config.get("data", {})
 
-    trainer, train_df, test_df = xgboost_training_setup(
+    trainer, test_df, dataset = xgboost_training_setup(
         data_config=data_config,
     )
-    print(f"✓ Loaded {len(train_df)} samples with {len(train_df.columns)} features")
+    test_X, test_y = dataset.split_X_y(test_df)
 
     def train_trial():
         with wandb.init(project=project_name, config=data_config) as run:
@@ -535,7 +550,8 @@ def run_xgboost_tune(
             train_and_evaluate_xgboost(
                 params=run.config,
                 trainer=trainer,
-                test_df=test_df,
+                test_X=test_X,
+                test_y=test_y,
                 wandb_run=run,
                 save_model=True,
                 model_suffix=f"_sweep_{run.id}",
@@ -582,14 +598,13 @@ def run_linear_regression(
 
     count = count or sweep_config.get("count", 10) if sweep and sweep_config else None
     dataset = ModularCellFeaturesDataset(data_config=data_config)
-    train_df, test_df = dataset.split_train_test_set()
+    train_df, test_df, val_df = dataset.split_set()
     feature_names = [
         column for column in train_df.columns.tolist() if not column.startswith("label_")
     ]
-    X, y = dataset.split_X_y(train_df)
-    X_train, y_train, X_val, y_val = train_val_split(
-        X, y, split_ratio=config.get("train_val_split_ratio", 0.8), random_state=42
-    )
+    X_train, y_train = dataset.split_X_y(train_df)
+    X_val, y_val = dataset.split_X_y(val_df)
+    X_test, y_test = dataset.split_X_y(test_df)
 
     def train_trial(trial_config, wandb_run, model=model):
         # Use config from sweep or default
@@ -617,17 +632,28 @@ def run_linear_regression(
             wandb_run=wandb_run,
         )
         metrics.update(val_metrics)
+        test_metrics = evaluate_regression(
+            y_test,
+            model.predict(X_test),
+            prefix="test",
+            plot=False,
+            wandb_run=wandb_run,
+        )
         importance = np.abs(model.coef_)
         importance_df = pd.DataFrame(
             data=importance,
             columns=feature_names,
             index=["488", "561"],
         )
+
         wandb.log({"feature_importance": wandb.Table(dataframe=importance_df)})
         print(f"{model_name} Regression Validation Results:")
         print(f"MSE: {metrics['val_mse']:.4f}")
         print(f"MAE: {metrics['val_mae']:.4f}")
         print(f"R2: {metrics['val_r2']:.4f}")
+        print(f"\nTest Metrics:")
+        for k, v in test_metrics.items():
+            print(f"  {k}: {v:.4f}")
 
     if sweep and sweep_config is not None:
         # W&B sweep
