@@ -405,7 +405,7 @@ def xgboost_training_setup(
 
     dataset = ModularCellFeaturesDataset(data_config=data_config)
 
-    train_df, test_df, val_df = dataset.split_set()
+    train_df, val_df, test_df = dataset.split_set()
 
     trainer = XGBoostCellCycleTrainer(
         training_data=train_df, val_data=val_df, wandb_run=wandb_run, dataset=dataset

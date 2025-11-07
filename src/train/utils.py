@@ -50,47 +50,16 @@ def evaluate_regression(y, preds, prefix, wandb_run, plot=True):
 
 def log_regression_plots(y, preds, wandb_run, prefix):
     """
-    Log regression plots to W&B.
+    Log a standard suite of regression plots to W&B.
 
-    Args:
-        y (np.ndarray): True target values.
-        preds (np.ndarray): Predicted values.
-        wandb_run: W&B run for logging plots.
-        prefix (str): Prefix for plot titles.
+    This automatically handles 1D targets (e.g., phase) and 2D targets (FUCCI intensities) and
+    logs: true residual diagnostics, prediction scatter, true-vs-pred per target, and residual plots.
     """
     log_plot(
         y,
         preds=preds,
-        mode="true_residuals_plot",
         log_scale=False,
-        title=f"{prefix} Set Error Scatter Plot",
-        wandb_run=wandb_run,
-        prefix=prefix,
-    )
-    log_plot(
-        y,
-        preds=preds,
-        mode="val_pred",
-        log_scale=False,
-        title=f"{prefix} Set: Intensity Predictions Scatter Plot",
-        wandb_run=wandb_run,
-        prefix=prefix,
-    )
-    log_plot(
-        y,
-        preds=preds,
-        mode="true_pred",
-        log_scale=False,
-        title=f"{prefix} Set: Predicted vs True Scatter Plot",
-        wandb_run=wandb_run,
-        prefix=prefix,
-    )
-    log_plot(
-        y,
-        preds=preds,
-        mode="residuals_plot",
-        log_scale=False,
-        title=f"{prefix} Set: Residuals Plot",
+        title=f"{prefix} Set Diagnostics",
         wandb_run=wandb_run,
         prefix=prefix,
     )
@@ -124,31 +93,34 @@ def error_heatmap_plot(fig, ax, x, y_, errors_norm, error_label, bins=250, title
     return fig, ax
 
 
-def log_plot(y, preds, mode="error", log_scale=True, title=None, wandb_run=None, prefix=None):
+def log_plot(y, preds, log_scale=True, title=None, wandb_run=None, prefix=None):
     """
-        cbar = fig.colorbar(im, ax=ax)
-        cbar.set_label("Mean Norm Residuals", rotation=270, labelpad=20)
+    Create and log a suite of diagnostic plots for regression.
 
-    Args:
-        y (np.ndarray): True target values.
-        preds (np.ndarray): Predicted values.
-        mode (str): Plot type ('error', 'val_pred', 'true_pred', 'residuals_plot').
-        log_scale (bool): If True, use log-transformed axes for better visualization.
-        title (str): Optional plot title.
-        wandb_run: Optional W&B run for logging plots.
-
-    Raises:
-        ValueError: If mode is not recognized.
+    Handles both 1D targets (e.g., phase) and 2D targets (intensities).
+    Logs figures with keys:
+      - {prefix}_true_residuals_plot
+      - {prefix}_pred_scatter
+      - {prefix}_true_vs_pred_scatter
+      - {prefix}_residuals_plot
     """
     import matplotlib.pyplot as plt
 
-    channels = [(0, "488"), (1, "561")]
+    # Normalize shapes to (N, D)
+    y = np.asarray(y)
+    preds = np.asarray(preds)
+    if y.ndim == 1:
+        y = y[:, None]
+    if preds.ndim == 1:
+        preds = preds[:, None]
+
+    n_targets = y.shape[1]
+    channels = [(i, lbl) for i, lbl in enumerate(["488", "561"][:n_targets])]
     errors = y - preds
-    errors_norm = np.linalg.norm(errors, axis=1)
+    errors_norm = np.abs(errors[:, 0]) if n_targets == 1 else np.linalg.norm(errors, axis=1)
 
-    if mode == "true_residuals_plot":
-        import matplotlib.pyplot as plt
-
+    # 1) True residuals diagnostics
+    if n_targets != 1:
         if log_scale:
             x = np.log(y[:, 0])
             y_ = np.log(y[:, 1])
@@ -156,7 +128,7 @@ def log_plot(y, preds, mode="error", log_scale=True, title=None, wandb_run=None,
             x = y[:, 0]
             y_ = y[:, 1]
         fig, axes = plt.subplots(1, 6, figsize=(36, 6))
-        for i, (errors, label) in enumerate(
+        for i, (e_vals, label) in enumerate(
             (
                 (np.abs(errors[:, 0]), "Absolute residual 488 intensity"),
                 (np.abs(errors[:, 1]), "Absolute residual 561 intensity"),
@@ -164,25 +136,38 @@ def log_plot(y, preds, mode="error", log_scale=True, title=None, wandb_run=None,
             )
         ):
             i = i * 2
-            # Scatter plot
-            sc = axes[i].scatter(x, y_, c=errors, cmap="Blues", alpha=0.7)
+            sc = axes[i].scatter(x, y_, c=e_vals, cmap="Blues", alpha=0.7)
             axes[i].set_xlabel(f"{'Log ' if log_scale else ''}488 True Intensity")
             axes[i].set_ylabel(f"{'Log ' if log_scale else ''}561 True Intensity")
             axes[i].set_title(f"Residuals Scatter Plot {i+1}")
             fig.colorbar(sc, ax=axes[i], label=label)
 
-            # Error heatmap (call extra method)
-            heatmap_fig, _ = error_heatmap_plot(
-                fig, axes[i + 1], x, y_, errors, error_label=label, bins=30
-            )
+            error_heatmap_plot(fig, axes[i + 1], x, y_, e_vals, error_label=label, bins=30)
         if wandb_run is not None:
             wandb_run.log({f"{prefix}_true_residuals_plot": wandb.Image(fig)})
-    elif mode == "val_pred":
-        import matplotlib.pyplot as plt
+        plt.close(fig)
 
-        plt.figure(figsize=(8, 6))
+    # 2) Prediction scatter field (and 1D true-vs-pred)
+    if n_targets == 1:
+        fig2 = plt.figure(figsize=(8, 6))
+        y_true = np.log(y[:, 0]) if log_scale else y[:, 0]
+        y_pred = np.log(preds[:, 0]) if log_scale else preds[:, 0]
+        abs_err = np.abs(errors[:, 0])
+        sc = plt.scatter(y_true, y_pred, c=abs_err, cmap="Blues", alpha=0.7)
+        axis_min = min(y_true.min(), y_pred.min())
+        axis_max = max(y_true.max(), y_pred.max())
+        plt.plot([axis_min, axis_max], [axis_min, axis_max], "r--", lw=1)
+        plt.colorbar(sc, label="Absolute Residual")
+        plt.xlabel(f"{'Log ' if log_scale else ''}True Value")
+        plt.ylabel(f"{'Log ' if log_scale else ''}Predicted Value")
+        plt.title("Predicted vs True (1D)")
+        if wandb_run is not None:
+            wandb_run.log({f"{prefix}_pred_scatter": wandb.Image(fig2)})
+            wandb_run.log({f"{prefix}_true_vs_pred_scatter": wandb.Image(fig2)})
+        plt.close(fig2)
+    else:
+        fig2 = plt.figure(figsize=(8, 6))
         if log_scale:
-            # Plot true labels with low intensity
             plt.scatter(np.log(y[:, 0]), np.log(y[:, 1]), c="gray", alpha=0.2, label="True Labels")
             sc = plt.scatter(
                 np.log(preds[:, 0]),
@@ -202,55 +187,64 @@ def log_plot(y, preds, mode="error", log_scale=True, title=None, wandb_run=None,
                 alpha=0.7,
                 label="Predictions",
             )
-
         plt.colorbar(sc, label="Norm Residuals")
         plt.xlabel(f"{'Log ' if log_scale else ''}488 Predicted Intensity")
         plt.ylabel(f"{'Log ' if log_scale else ''}561 Predicted Intensity")
-        plt.title(title or "Validation Set Intensity Predictions Scatter Plot")
+        plt.title("Intensity Predictions Scatter Plot")
         plt.legend()
         if wandb_run is not None:
-            wandb_run.log({f"{prefix}_pred_scatter": wandb.Image(plt)})
-    elif mode == "true_pred":
-        fig, axes = plt.subplots(1, 2, figsize=(12, 6))
-        for ax, (i, label) in zip(axes, channels):
-            x = np.log(y[:, i]) if log_scale else y[:, i]
-            y_pred = np.log(preds[:, i]) if log_scale else preds[:, i]
-            ax.scatter(x, y_pred, alpha=0.7, label=label)
-            axis_min = min(x.min(), y_pred.min())
-            axis_max = max(x.max(), y_pred.max())
+            wandb_run.log({f"{prefix}_pred_scatter": wandb.Image(fig2)})
+        plt.close(fig2)
+
+        # True vs Pred per-channel
+        fig3, axes3 = plt.subplots(1, 2, figsize=(12, 6))
+        for ax, (i, label) in zip(axes3, channels):
+            xch = np.log(y[:, i]) if log_scale else y[:, i]
+            y_pred_ch = np.log(preds[:, i]) if log_scale else preds[:, i]
+            ax.scatter(xch, y_pred_ch, alpha=0.7, label=label)
+            axis_min = min(xch.min(), y_pred_ch.min())
+            axis_max = max(xch.max(), y_pred_ch.max())
             ax.plot(
-                [axis_min, axis_max],
-                [axis_min, axis_max],
-                linestyle="--",
-                color="red",
-                linewidth=1,
+                [axis_min, axis_max], [axis_min, axis_max], linestyle="--", color="red", linewidth=1
             )
             ax.set_xlabel(f"{'Log ' if log_scale else ''}True Intensity ({label})")
             ax.set_ylabel(f"{'Log ' if log_scale else ''}Predicted Intensity ({label})")
             ax.set_title(f"{label}: Predicted vs True")
-
-        plt.suptitle(title or "Validation Set: Predicted vs True Scatter Plot")
+        plt.suptitle("Predicted vs True Scatter Plot")
         if wandb_run is not None:
-            wandb_run.log({f"{prefix}_true_vs_pred_scatter": wandb.Image(plt)})
-    elif mode == "residuals_plot":
-        fig, axes = plt.subplots(1, 3, figsize=(18, 6))
-        for ax, (i, label) in zip(axes, channels):
+            wandb_run.log({f"{prefix}_true_vs_pred_scatter": wandb.Image(fig3)})
+        plt.close(fig3)
+
+    # 3) Residuals plots
+    if n_targets == 1:
+        fig4, axes4 = plt.subplots(1, 2, figsize=(12, 5))
+        y_pred = np.log(preds[:, 0]) if log_scale else preds[:, 0]
+        axes4[0].scatter(y_pred, errors[:, 0], alpha=0.7)
+        axes4[0].set_xlabel("Predicted Value")
+        axes4[0].set_ylabel("Residual: True - Predicted")
+        axes4[0].set_title("Residuals vs Predicted (1D)")
+
+        axes4[1].hist(errors[:, 0], bins=40, alpha=0.8, color="tab:gray")
+        axes4[1].set_xlabel("Residual")
+        axes4[1].set_ylabel("Count")
+        axes4[1].set_title("Residuals Histogram")
+        if wandb_run is not None:
+            wandb_run.log({f"{prefix}_residuals_plot": wandb.Image(fig4)})
+        plt.close(fig4)
+    else:
+        fig4, axes4 = plt.subplots(1, 3, figsize=(18, 6))
+        for ax, (i, label) in zip(axes4, channels):
             ax.scatter(preds[:, i], errors[:, i], alpha=0.7, label=label)
             ax.set_xlabel(f"Predicted Intensity ({label})")
             ax.set_ylabel(f"Residuals: True - Predicted ({label})")
             ax.set_title(f"{label}: Residuals plot")
-
-        plt.suptitle(title or "Validation Set: Residuals Plot")
-        axes[2].scatter(np.linalg.norm(preds, axis=1), errors_norm, alpha=0.7, label="Norm")
-        axes[2].set_xlabel("Predicted Intensity (Norm)")
-        axes[2].set_ylabel("Residuals (Norm)")
-        axes[2].set_title("Norm: Residuals / intensity distribution")
+        axes4[2].scatter(np.linalg.norm(preds, axis=1), errors_norm, alpha=0.7, label="Norm")
+        axes4[2].set_xlabel("Predicted Intensity (Norm)")
+        axes4[2].set_ylabel("Residuals (Norm)")
+        axes4[2].set_title("Norm: Residuals / intensity distribution")
         if wandb_run is not None:
-            wandb_run.log({f"{prefix}_residuals_plot": wandb.Image(plt)})
-    else:
-        raise ValueError(f"Invalid mode: {mode}")
-    plt.tight_layout()
-    plt.close()
+            wandb_run.log({f"{prefix}_residuals_plot": wandb.Image(fig4)})
+        plt.close(fig4)
 
 
 def train_val_split(
