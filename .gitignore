@@ -31,6 +31,9 @@ venv/
 env/
 ENV/
 
+# Environment variables (contains secrets)
+.env
+
 # IDE
 .vscode/
 .idea/
@@ -47,3 +50,17 @@ Thumbs.db
 # Logs
 logs/*
 *mlruns/*
+wandb/*
+
+# Model
+checkpoints/
+
+# Images
+*.png
+
+# Jsons
+*.json
+
+# Logs
+*.log
+lightning_logs/
