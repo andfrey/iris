@@ -1,8 +1,8 @@
-model_name: Lasso
+model_name: Ridge
 model:
-  # LASSO Regression Model Configuration
+  # Ridge Regression Model Configuration
 
-  # Default LASSO hyperparameters (used for single fit runs)
+  # Default Ridge hyperparameters (used for single fit runs)
   # Regularization strength
   alpha: 1.0
 
@@ -27,9 +27,8 @@ data:
   max_nuclei_outside_ratio: 0.2
   force_refilter: false  # Use cached results if available
 
-  fucci_scale_transform:
-    scale_divider_488: 16464.0
-    scale_divider_561: 31173.0
+  fucci_transform:
+    log: {}
 
   feature_transform_config:
    - class_path: sklearn.preprocessing.StandardScaler

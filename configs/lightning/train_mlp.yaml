@@ -1,0 +1,48 @@
+# Lightning training config for MLP on features
+
+project_name: mlp_cell_cycle
+experiment_name: mlp_experiment
+
+trainer:
+  default_root_dir: checkpoints/mlp/
+  max_epochs: 100
+  accelerator: auto
+  devices: 1
+  log_every_n_steps: 10
+  enable_checkpointing: true
+  profiler: simple
+  callbacks:
+    - class_path: lightning.pytorch.callbacks.ModelSummary
+      init_args:
+        max_depth: -1
+    - class_path: lightning.pytorch.callbacks.ModelCheckpoint
+      init_args:
+        monitor: val_loss
+        mode: min
+        save_top_k: 3
+        filename: 'epoch{epoch:02d}-val_loss{val_loss:.4f}'
+        auto_insert_metric_name: false
+    - class_path: lightning.pytorch.callbacks.EarlyStopping
+      init_args:
+        monitor: val_loss
+        patience: 20
+        mode: min
+    - class_path: lightning.pytorch.callbacks.LearningRateMonitor
+      init_args:
+        logging_interval: step
+
+model:
+  model: MLP
+  init_args:
+    input_dim: 19
+    hidden_dims: [256, 128]
+    output_dim: 2
+    activation: relu
+    dropout: 0.1
+    learning_rate: 0.001
+    optimizer: adamw
+    weight_decay: 0.001
+    scheduler: cosine
+
+data:
+  data_config_path: "/myhome/iris/configs/lightning/data_config_image_features.yaml"

@@ -79,7 +79,7 @@ class FeatureExtractor:
         """
         features = {}
         try:
-            middle_idx = len(cell_data.channels["405"]) // 2
+            middle_idx = len(cell_data.segmentation) // 2 if len(cell_data.segmentation) > 0 else 0
 
             nucleus_image = cell_data.channels["405"][middle_idx]
             seg_mask = cell_data.segmentation[middle_idx]

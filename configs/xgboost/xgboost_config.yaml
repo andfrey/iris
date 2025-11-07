@@ -42,7 +42,7 @@ data:
 
   # Train/test split ratio
   train: 0.9  # Train, Val, Test splits
-  train_val_split_ratio: 0.8
+  data_split: [0.7, 0.2, 0.1]
   seed: 42
 
   # Quality filters
@@ -53,10 +53,15 @@ data:
   max_nuclei_outside_ratio: 0.2
   force_refilter: false  # Use cached results if available
 
-  fucci_scale_transform:
-    scale_divider_488: 16464.0
-    scale_divider_561: 31173.0
+  fucci_transform:
+    log: {}
 
+  image_transform_config:
+  - class_path: src.data_pipeline.data_transforms.SelectPlanesTransform
+    init_args:
+      plane_selection: 'middle'
   feature_transform_config:
    - class_path: sklearn.preprocessing.StandardScaler
      init_args: {}
+
+  fucci_project_to_curve: true

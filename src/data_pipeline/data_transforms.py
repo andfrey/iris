@@ -128,36 +128,6 @@ class RemoveBackgroundTransform(Transform):
         }
 
 
-class FUCCIScaleTransform(ChannelTransform):
-    """Scale FUCCI channel intensities based on predefined factors"""
-
-    def __init__(
-        self,
-        channel_keys: Optional[List[str]] = ["488", "561"],
-        scale_divider_488: float = 18_000,
-        scale_divider_561: float = 40_000,
-    ):
-        super().__init__(channel_keys)
-        self.scale_factors = {
-            "488": 1.0 / scale_divider_488,
-            "561": 1.0 / scale_divider_561,
-        }
-
-    def transform_image(self, image: np.ndarray, channel_key: str) -> np.ndarray:
-        scale_factor = self.scale_factors.get(channel_key)
-        if scale_factor is None:
-            raise ValueError(f"No scale factor defined for channel {channel_key}")
-
-        return image * scale_factor
-
-    def get_config(self) -> Dict[str, Any]:
-        return {
-            "type": "FUCCIScaleTransform",
-            "channel_keys": self.channel_keys,
-            "scale_factors": self.scale_factors,
-        }
-
-
 class CenterCellTransform(Transform):
     """Center the cell in the image"""
 

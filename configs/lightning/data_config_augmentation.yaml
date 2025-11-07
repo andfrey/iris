@@ -3,7 +3,7 @@
 
   # DataLoader settings
   batch_size: 64
-  num_workers: 16  # Use 0 for A100 to avoid shared memory issues
+  num_workers: 16 # Use 0 for A100 to avoid shared memory issues
 
   # Train/val split
   data_split: [0.7, 0.2, 0.1]  # Train, Val, Test splits
@@ -20,9 +20,27 @@
     log: {}
   # Preprocessing transforms
   image_transform_config:
+    - class_path: src.data_pipeline.data_transforms.SelectPlanesTransform
+      init_args:
+        plane_selection: 'middle'
     - class_path: src.data_pipeline.data_transforms.NormalizeTransform
       init_args:
         method: standardize  # Changed to standardize for zero mean and unit variance
         channel_keys: ['405', 'bf']
-    - class_path: src.data_pipeline.data_transforms.RemoveBackgroundTransform
-      init_args: {}
+
+  augmentations:
+    RandomHorizontalFlip:
+      p: 0.5
+    RandomVerticalFlip:
+      p: 0.5
+    RandomRotation:
+      degrees: 360
+    GaussianBlur:
+      sigma: [0.01, 0.5]
+      kernel_size: [5,5]
+    RandomErasing:
+      p: 0.3
+      scale: [0.01, 0.2]
+      ratio: [0.5, 2.0]
+
+  fucci_project_to_curve: false

@@ -1,7 +1,7 @@
 # W&B Sweep configuration for XGBoost hyperparameter tuning
 # See: https://docs.wandb.ai/guides/sweeps/configuration
 
-project: cell_cycle_xgboost_seep
+project: cell_cycle_xgboost_sweep
 count: 150
 method: bayes  # Options: grid, random, bayes
 metric:
@@ -56,3 +56,6 @@ parameters:
     distribution: uniform
     min: 0.0
     max: 5.0
+
+  multi_strategy:
+    values: ["multi_output_tree", "one_output_per_tree"]

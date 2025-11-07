@@ -2,6 +2,7 @@
 Tests for data_transforms module.
 """
 
+from copy import deepcopy
 import pytest
 import numpy as np
 from pathlib import Path
@@ -14,7 +15,6 @@ from src.data_pipeline.data_transforms import (
     NormalizeTransform,
     GaussianFilterTransform,
     TransformPipeline,
-    FUCCIScaleTransform,
     RemoveBackgroundTransform,
     CenterCellTransform,
 )
@@ -184,195 +184,6 @@ class TestSelectPlanesTransform:
 
         # Should keep all planes
         assert len(result.channels["405"]) == 3
-
-
-class TestFUCCIScaleTransform:
-    """Test FUCCIScaleTransform."""
-
-    def test_default_scale_factors(self):
-        """Test scaling with default scale factors."""
-        transform = FUCCIScaleTransform()
-
-        # Create test data with known values
-        channels = {
-            "488": [np.ones((250, 250)) * 18000],  # Should scale to 1.0
-            "561": [np.ones((250, 250)) * 40000],  # Should scale to 1.0
-        }
-        cell_data = CellData(cell_id="test", channels=channels, segmentation=[np.zeros((250, 250))])
-
-        result = transform(cell_data)
-
-        # Check scaling applied correctly
-        assert np.all(result.channels["488"][0] == 1.0)
-        assert np.all(result.channels["561"][0] == 1.0)
-
-    def test_custom_scale_factors(self):
-        """Test scaling with custom scale factors."""
-        transform = FUCCIScaleTransform(scale_divider_488=10000, scale_divider_561=20000)
-
-        channels = {
-            "488": [np.ones((250, 250)) * 10000],  # Should scale to 1.0
-            "561": [np.ones((250, 250)) * 20000],  # Should scale to 1.0
-        }
-        cell_data = CellData(cell_id="test", channels=channels, segmentation=[np.zeros((250, 250))])
-
-        result = transform(cell_data)
-
-        assert np.all(result.channels["488"][0] == 1.0)
-        assert np.all(result.channels["561"][0] == 1.0)
-
-    def test_scale_488_channel_only(self):
-        """Test scaling only 488 channel."""
-        transform = FUCCIScaleTransform(channel_keys=["488"])
-
-        channels = {
-            "488": [np.ones((250, 250)) * 18000],
-            "561": [np.ones((250, 250)) * 40000],  # Should NOT be scaled
-        }
-        cell_data = CellData(cell_id="test", channels=channels, segmentation=[np.zeros((250, 250))])
-
-        result = transform(cell_data)
-
-        # 488 should be scaled
-        assert np.allclose(result.channels["488"][0], 1.0)
-        # 561 should remain unchanged
-        assert np.allclose(result.channels["561"][0], 40000)
-
-    def test_scale_multiple_planes(self):
-        """Test scaling with multiple planes."""
-        transform = FUCCIScaleTransform()
-
-        channels = {
-            "488": [
-                np.ones((250, 250)) * 18000,
-                np.ones((250, 250)) * 36000,
-                np.ones((250, 250)) * 9000,
-            ],
-            "561": [
-                np.ones((250, 250)) * 40000,
-                np.ones((250, 250)) * 80000,
-                np.ones((250, 250)) * 20000,
-            ],
-        }
-        cell_data = CellData(
-            cell_id="test", channels=channels, segmentation=[np.zeros((250, 250))] * 3
-        )
-
-        result = transform(cell_data)
-
-        # Check all planes are scaled
-        assert len(result.channels["488"]) == 3
-        assert len(result.channels["561"]) == 3
-
-        # Check specific values
-        assert np.allclose(result.channels["488"][0], 1.0)
-        assert np.allclose(result.channels["488"][1], 2.0)
-        assert np.allclose(result.channels["488"][2], 0.5)
-
-        assert np.allclose(result.channels["561"][0], 1.0)
-        assert np.allclose(result.channels["561"][1], 2.0)
-        assert np.allclose(result.channels["561"][2], 0.5)
-
-    def test_scale_with_real_intensities(self):
-        """Test scaling with realistic intensity values."""
-        transform = FUCCIScaleTransform()
-
-        # Realistic intensity ranges
-        channels = {
-            "488": [np.random.randint(5000, 30000, size=(250, 250)).astype(float)],
-            "561": [np.random.randint(10000, 60000, size=(250, 250)).astype(float)],
-        }
-        cell_data = CellData(cell_id="test", channels=channels, segmentation=[np.zeros((250, 250))])
-
-        result = transform(cell_data)
-
-        # Scaled values should be in reasonable range
-        assert result.channels["488"][0].min() > 0
-        assert result.channels["488"][0].max() < 2.0  # ~30000 / 18000
-        assert result.channels["561"][0].min() > 0
-        assert result.channels["561"][0].max() < 2.0  # ~60000 / 40000
-
-    def test_scale_preserves_other_channels(self):
-        """Test that non-FUCCI channels are not modified."""
-        transform = FUCCIScaleTransform()
-
-        channels = {
-            "488": [np.ones((250, 250)) * 18000],
-            "561": [np.ones((250, 250)) * 40000],
-            "bf": [np.ones((250, 250)) * 1000],  # Should remain unchanged
-            "405": [np.ones((250, 250)) * 5000],  # Should remain unchanged
-        }
-        cell_data = CellData(cell_id="test", channels=channels, segmentation=[np.zeros((250, 250))])
-
-        result = transform(cell_data)
-
-        # FUCCI channels scaled
-        assert np.allclose(result.channels["488"][0], 1.0)
-        assert np.allclose(result.channels["561"][0], 1.0)
-        # Other channels unchanged
-        assert np.allclose(result.channels["bf"][0], 1000)
-        assert np.allclose(result.channels["405"][0], 5000)
-
-    def test_invalid_channel_error(self):
-        """Test error when scaling unsupported channel."""
-        # Create transform with unsupported channel
-        transform = FUCCIScaleTransform(channel_keys=["unsupported_channel"])
-
-        channels = {
-            "unsupported_channel": [np.ones((250, 250)) * 1000],
-        }
-        cell_data = CellData(cell_id="test", channels=channels, segmentation=[np.zeros((250, 250))])
-
-        # Should raise ValueError for undefined scale factor
-        with pytest.raises(ValueError, match="No scale factor defined"):
-            transform(cell_data)
-
-    def test_get_config(self):
-        """Test getting transform configuration."""
-        transform = FUCCIScaleTransform(scale_divider_488=15000, scale_divider_561=35000)
-
-        config = transform.get_config()
-
-        assert config["type"] == "FUCCIScaleTransform"
-        assert "channel_keys" in config
-        assert "scale_factors" in config
-        assert config["scale_factors"]["488"] == 1.0 / 15000
-        assert config["scale_factors"]["561"] == 1.0 / 35000
-
-    def test_scale_in_pipeline(self):
-        """Test FUCCIScaleTransform in a pipeline."""
-        transforms = [
-            SelectPlanesTransform(plane_selection="middle"),
-            FUCCIScaleTransform(),
-            NormalizeTransform(method="minmax", channel_keys=["488", "561"]),
-        ]
-        pipeline = TransformPipeline(transforms)
-
-        channels = {
-            "488": [
-                np.ones((250, 250)) * 9000,
-                np.ones((250, 250)) * 18000,
-                np.ones((250, 250)) * 27000,
-            ],
-            "561": [
-                np.ones((250, 250)) * 20000,
-                np.ones((250, 250)) * 40000,
-                np.ones((250, 250)) * 60000,
-            ],
-        }
-        cell_data = CellData(
-            cell_id="test", channels=channels, segmentation=[np.zeros((250, 250))] * 3
-        )
-
-        result = pipeline(cell_data)
-
-        # After SelectPlanes: middle plane selected
-        # After FUCCIScale: values scaled
-        # After Normalize: values in [0, 1]
-        assert len(result.channels["488"]) == 1
-        assert len(result.channels["561"]) == 1
-        assert 0 <= result.channels["488"][0].min() <= result.channels["488"][0].max() <= 1
-        assert 0 <= result.channels["561"][0].min() <= result.channels["561"][0].max() <= 1
 
 
 class TestNormalizeTransform:

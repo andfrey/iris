@@ -4,6 +4,7 @@
   # DataLoader settings
   batch_size: 64
   num_workers: 16  # Use 0 for A100 to avoid shared memory issues
+  input_channels: ['segmentation', 'nuclei_segmentation']
 
   # Train/val split
   data_split: [0.7, 0.2, 0.1]  # Train, Val, Test splits
@@ -16,13 +17,13 @@
   min_seg_pixels: 10
   max_nuclei_outside_ratio: 0.2
   force_refilter: false  # Use cached results if available
+
   fucci_transform:
     log: {}
   # Preprocessing transforms
   image_transform_config:
-    - class_path: src.data_pipeline.data_transforms.NormalizeTransform
-      init_args:
-        method: standardize  # Changed to standardize for zero mean and unit variance
-        channel_keys: ['405', 'bf']
-    - class_path: src.data_pipeline.data_transforms.RemoveBackgroundTransform
+    - class_path: src.data_pipeline.data_transforms.CenterCellTransform
       init_args: {}
+    - class_path: src.data_pipeline.data_transforms.SelectPlanesTransform
+      init_args:
+        plane_selection: 'middle'

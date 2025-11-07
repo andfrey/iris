@@ -29,7 +29,7 @@ pytestmark = pytest.mark.skipif(
 @pytest.fixture
 def data_config_path():
     """Return path to the default data config."""
-    return Path(__file__).resolve().parent / ".." / "configs/data_config.yaml"
+    return Path(__file__).resolve().parent / ".." / "configs/lightning/data_config.yaml"
 
 
 @pytest.fixture
@@ -86,7 +86,6 @@ def test_datamodule_initialization(data_config_path):
     assert dm.h5_path is not None
     assert dm.batch_size > 0
     assert dm.num_workers >= 0
-    assert dm.use_quality_filters is not None
 
     # Check datasets are not yet initialized
     assert dm.train_dataset is None
@@ -141,16 +140,17 @@ def test_datamodule_split_ratios(setup_datamodule):
     assert abs(test_len / full_len - expected_test) < 0.05
 
 
-def test_datamodule_reproducible_split():
+def test_datamodule_reproducible_split(data_config_path):
     """Test that splits are reproducible with same seed."""
-    config_path = "configs/data_config.yaml"
 
     # Create two data modules with same seed
-    dm1 = ModularCellDataModule(data_config_path=config_path)
+    dm1 = ModularCellDataModule(data_config_path=data_config_path)
     dm1.prepare_data()
     dm1.setup(stage="fit")
 
-    dm2 = ModularCellDataModule(data_config_path=config_path)
+    dm2 = ModularCellDataModule(
+        data_config_path=data_config_path,
+    )
     dm2.prepare_data()
     dm2.setup(stage="fit")
 
@@ -219,6 +219,24 @@ def test_predict_dataloader(setup_datamodule):
 # ============================================================================
 # Test Batch Shapes and Types
 # ============================================================================
+def test_labels_transformation_invariance(data_config_path):
+    """Test that labels transformation is invariant to data module setup."""
+    dm1 = ModularCellDataModule(data_config_path=data_config_path)
+    dm1.prepare_data()
+    dm1.setup(stage="fit")
+
+    dm2 = ModularCellDataModule(
+        data_config_path="/myhome/iris/configs/lightning/data_config_mask_input.yaml"
+    )
+    dm2.prepare_data()
+    dm2.setup(stage="fit")
+
+    # Get first sample from train datasets
+    _, label1 = dm1.train_dataset[0]
+    _, label2 = dm2.train_dataset[0]
+
+    # Labels should be identical
+    assert torch.allclose(label1, label2)
 
 
 @pytest.mark.skipif(os.getenv("PRECOMMIT") == "1", reason="Skip in pre-commit")
