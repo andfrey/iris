@@ -68,6 +68,9 @@ def mock_config():
     return {
         "h5_path": "data/test.h5",
         "seed": 42,
+        # Use explicit 3-way split ratios (train, val, test)
+        "data_split": [0.8, 0.1, 0.1],
+        # Deprecated/ignored in current pipeline but retained for backward-compat in tests
         "train_test_ratio": 0.8,
         "use_quality_filters": False,
     }
@@ -93,7 +96,6 @@ def mock_dataset(mock_config):
 
         dataset = ModularCellFeaturesDataset(
             data_config=mock_config,
-            mask_intensity="segmentation",
             use_cache=False,  # Disable cache for most tests
         )
 
@@ -346,23 +348,23 @@ class TestSplitMethods:
         assert np.allclose(y[:, 0], df["label_488"].values)
         assert np.allclose(y[:, 1], df["label_561"].values)
 
-    def test_split_train_test_set(self, mock_dataset):
-        """Test train/test splitting."""
-        train_df, test_df = mock_dataset.split_train_test_set()
+    def test_split_train_val_test_set(self, mock_dataset):
+        """Test train/val/test splitting using split_set."""
+        train_df, val_df, test_df = mock_dataset.split_set()
 
         assert isinstance(train_df, pd.DataFrame)
+        assert isinstance(val_df, pd.DataFrame)
         assert isinstance(test_df, pd.DataFrame)
 
-        # Check sizes
-        total_size = len(train_df) + len(test_df)
+        total_size = len(train_df) + len(val_df) + len(test_df)
         assert total_size == len(mock_dataset)
 
-        # Check train is larger (default 0.9 split)
-        assert len(train_df) > len(test_df)
+        # With default [0.8, 0.1, 0.1], train should be largest
+        assert len(train_df) > len(val_df) and len(train_df) > len(test_df)
 
-    def test_split_train_test_set_ratio(self, mock_config):
-        """Test that train/test ratio is respected."""
-        mock_config["train_test_ratio"] = 0.7
+    def test_split_train_val_test_set_ratio(self, mock_config):
+        """Test that train/val/test ratio is respected."""
+        mock_config["data_split"] = [0.7, 0.2, 0.1]
         mock_config["image_transform_config"] = []
         mock_config["feature_transform_config"] = []
 
@@ -370,19 +372,26 @@ class TestSplitMethods:
             mock_source.return_value = MockDataSource(num_cells=100)
 
             dataset = ModularCellFeaturesDataset(data_config=mock_config, use_cache=False)
+            splits = dataset.config.get("data_split")
+            train_df, val_df, test_df = dataset.split_set()
 
-            train_df, test_df = dataset.split_train_test_set()
+            total = len(train_df) + len(val_df) + len(test_df)
+            train_ratio = len(train_df) / total
+            val_ratio = len(val_df) / total
+            test_ratio = len(test_df) / total
 
-            train_ratio = len(train_df) / (len(train_df) + len(test_df))
-            assert abs(train_ratio - 0.7) < 0.05  # Allow small deviation
+            assert abs(train_ratio - splits[0]) < 0.05  # Allow small deviation
+            assert abs(val_ratio - splits[1]) < 0.05
+            assert abs(test_ratio - splits[2]) < 0.05
 
     def test_split_reproducibility(self, mock_dataset):
         """Test that splits are reproducible with same seed."""
-        train_df1, test_df1 = mock_dataset.split_train_test_set()
-        train_df2, test_df2 = mock_dataset.split_train_test_set()
+        train_df1, val_df1, test_df1 = mock_dataset.split_set()
+        train_df2, val_df2, test_df2 = mock_dataset.split_set()
 
         # Should get same splits (same seed in config)
         assert len(train_df1) == len(train_df2)
+        assert len(val_df1) == len(val_df2)
         assert len(test_df1) == len(test_df2)
 
 

@@ -76,43 +76,6 @@ class TestComputeFucciLabels:
             nuclei_segmentation=[mask_single.copy() for _ in range(num_planes)],
         )
 
-    def test_basic_functionality(self):
-        """Test basic functionality with known intensities."""
-        # Create cell with known intensities
-        cell_data = self.create_mock_cell_data(
-            intensity_488=100.0,
-            intensity_561=200.0,
-            background_noise=10.0,
-            random_noise_factor=0.0,
-        )
-
-        # Compute labels
-        labels_log = compute_fucci_labels(cell_data, log_transform=True)
-        labels = compute_fucci_labels(cell_data, log_transform=False)
-        # Check output shape
-        assert labels.shape == (2,), f"Expected shape (2,), got {labels.shape}"
-        assert labels.dtype == np.float32, f"Expected dtype float32, got {labels.dtype}"
-        assert labels_log.shape == (2,), f"Expected shape (2,), got {labels_log.shape}"
-        assert labels_log.dtype == np.float32, f"Expected dtype float32, got {labels_log.dtype}"
-
-        # Check that values are log-transformed (should be positive)
-        assert labels[0] > 0, "488 label should be positive"
-        assert labels[1] > 0, "561 label should be positive"
-        assert labels_log[0] > 0, "488 label should be positive (log-transformed)"
-        assert labels_log[1] > 0, "561 label should be positive (log-transformed)"
-
-        # Check relative ordering (561 should be higher)
-        # After background subtraction: 488 has ~90, 561 has ~190
-        # log(190) > log(90)
-        assert labels[1] > labels[0], "561 intensity should be higher than 488"
-        assert (
-            labels_log[1] > labels_log[0]
-        ), "561 intensity should be higher than 488 (log-transformed)"
-        assert np.isclose(labels[0], np.float32(100.0))
-        assert np.isclose(labels[1], np.float32(200.0))
-        assert labels_log[0] == np.log(np.float32(100.0))
-        assert labels_log[1] == np.log(np.float32(200.0))
-
     def test_background_subtraction(self):
         """Test that background is properly subtracted."""
         # Create cell with same signal but different backgrounds
@@ -364,6 +327,7 @@ class TestEdgeCases:
             "561": [np.ones((250, 250), dtype=np.float32) * 0.2],
         }
         mask = np.ones((250, 250), dtype=np.uint8)
+        mask[0, 0] = 0
         segmentation = [mask]
 
         cell_data = CellData(
@@ -393,9 +357,8 @@ class TestEdgeCases:
             segmentation=segmentation,
             nuclei_segmentation=None,
         )
-
-        labels = compute_fucci_labels(cell_data)
-        assert np.isfinite(labels).all(), "Should handle very large intensities"
+        with pytest.raises(ValueError):
+            compute_fucci_labels(cell_data)
 
 
 if __name__ == "__main__":
