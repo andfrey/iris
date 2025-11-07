@@ -44,9 +44,7 @@ class CellFilter(ABC):
 class PlaneCountFilter(CellFilter):
     """Filter cells that don't have the expected number of planes per channel"""
 
-    def __init__(
-        self, expected_planes: int = 3, channels_to_check: Optional[List[str]] = None
-    ):
+    def __init__(self, expected_planes: int = 3, channels_to_check: Optional[List[str]] = None):
         self.expected_planes = expected_planes
         self.channels_to_check = channels_to_check or ["405", "488", "561", "bf"]
 
@@ -168,8 +166,9 @@ class CellNucleiOverlappingFilter(CellFilter):
     indicating a likely segmentation error.
     """
 
-    def __init__(self, max_ratio: float = 0.2):
+    def __init__(self, max_ratio: float = 0.2, max_ratio_nuclei: float = 0.5):
         self.max_ratio = max_ratio
+        self.max_ratio_nuclei = max_ratio_nuclei
 
     def __call__(self, cell_data) -> FilterResult:
         if cell_data.segmentation is None:
@@ -192,22 +191,38 @@ class CellNucleiOverlappingFilter(CellFilter):
         )
 
         cell_area = np.sum(seg > 0)
+        nuclei_area = np.sum(nuclei_seg > 0)
         nuclei_outside_cell = ((nuclei_seg > 0) & (seg == 0)).astype(int)
         nuclei_area_outside_cell = np.sum(nuclei_outside_cell)
 
         if cell_area == 0:
             return FilterResult(is_valid=False, reason="zero_cell_area")
 
-        ratio = nuclei_area_outside_cell / cell_area
+        cell_nuclei_outside_ratio = nuclei_area_outside_cell / cell_area
+        nuclei_nuclei_ouside_ratio = (
+            nuclei_area_outside_cell / nuclei_area if nuclei_area > 0 else 1
+        )
 
-        if ratio > self.max_ratio:
+        if cell_nuclei_outside_ratio > self.max_ratio:
             return FilterResult(
                 is_valid=False,
                 reason="nuclei_too_large",
                 metadata={
                     "nuclei_area_outside_cell": int(nuclei_area_outside_cell),
                     "cell_area": int(cell_area),
-                    "ratio": float(ratio),
+                    "ratio": float(cell_nuclei_outside_ratio),
+                    "max_ratio": self.max_ratio,
+                },
+            )
+
+        if nuclei_nuclei_ouside_ratio > self.max_ratio_nuclei:
+            return FilterResult(
+                is_valid=False,
+                reason="nuclei_outside_cell_too_large",
+                metadata={
+                    "nuclei_area_outside_cell": int(nuclei_area_outside_cell),
+                    "nuclei_area": int(nuclei_area),
+                    "ratio": float(nuclei_nuclei_ouside_ratio),
                     "max_ratio": self.max_ratio,
                 },
             )
@@ -215,7 +230,7 @@ class CellNucleiOverlappingFilter(CellFilter):
         return FilterResult(is_valid=True)
 
     def get_name(self) -> str:
-        return f"NucleCellNucleiOverlappingFilteriSize(max_ratio={self.max_ratio})"
+        return f"NucleCellNucleiOverlappingFilteriSize(max_ratio={self.max_ratio}, max_ratio_nuclei={self.max_ratio_nuclei})"
 
 
 class CompositeFilter:
@@ -274,9 +289,7 @@ class FilterStatistics:
 
         if self.rejection_reasons:
             print(f"\nRejection reasons:")
-            for reason, count in sorted(
-                self.rejection_reasons.items(), key=lambda x: -x[1]
-            ):
+            for reason, count in sorted(self.rejection_reasons.items(), key=lambda x: -x[1]):
                 print(f"  - {reason:30s}: {count:,}")
 
         if self.total_cells > 0:
