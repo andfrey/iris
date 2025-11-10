@@ -62,6 +62,7 @@ class CNet(L.LightningModule):
     def __init__(
         self,
         in_channels: int = 6,
+        feature_dim: int = 0,
         output_dim: int = 2,  # For 2D regression (e.g., x, y coordinates)
         base_filters: int = 32,
         num_blocks: int = 4,
@@ -117,14 +118,16 @@ class CNet(L.LightningModule):
 
         # Fully connected layers
         fc_layers = []
-        fc_input_dim = current_channels
+        fc_input_dim = (
+            current_channels + feature_dim
+        )  # Add feature_dim if using additional features
 
         for hidden_dim in fc_hidden_dims:
             fc_layers.extend(
                 [
                     nn.Linear(fc_input_dim, hidden_dim),
                     nn.ReLU(inplace=True),
-                    # nn.Dropout(dropout),
+                    nn.Dropout(dropout),
                 ]
             )
             fc_input_dim = hidden_dim
@@ -135,7 +138,7 @@ class CNet(L.LightningModule):
 
         self.criterion = nn.MSELoss()
 
-    def forward(self, x):
+    def forward(self, image_x, feature_x=None) -> torch.Tensor:
         """
         Forward pass
 
@@ -146,69 +149,31 @@ class CNet(L.LightningModule):
             For regression: predictions of shape (batch_size, output_dim)
             For classification: logits of shape (batch_size, output_dim)
         """
+
         # Ensure input is float32 for compatibility with mixed precision training
-        if x.dtype != torch.float32:
-            x = x.float()
+        if image_x.dtype != torch.float32:
+            image_x = image_x.float()
+        if feature_x is not None and feature_x.dtype != torch.float32:
+            feature_x = feature_x.float()
 
         # Convolutional blocks
         for block in self.conv_blocks:
-            x = block(x)
+            image_x = block(image_x)
 
         # Global pooling
-        x = self.global_pool(x)
-        x = x.view(x.size(0), -1)
+        conv_x = self.global_pool(image_x)
+        conv_x = conv_x.view(conv_x.size(0), -1)
 
-        # Fully connected layers
+        # Concatenate tensors if needed
+        if feature_x is not None:
+            tensor1 = conv_x
+            tensor2 = feature_x.view(feature_x.size(0), -1)
+            x = torch.cat([tensor1, tensor2], dim=1)
+        else:
+            x = conv_x
         x = self.fc(x)
 
         return x
-
-    def training_step(self, batch, batch_idx):
-        """Training step"""
-        x, y = batch
-
-        # Forward pass
-        predictions = self(x)
-        loss = self.criterion(predictions, y)
-
-        mae = F.l1_loss(predictions, y)
-        mse = F.mse_loss(predictions, y)
-
-        self.train_predictions.append(predictions.detach().cpu().numpy())
-        self.train_targets.append(y.detach().cpu().numpy())
-        # Log metrics
-        self.log(f"train_loss", loss, prog_bar=True, on_step=True, on_epoch=True)
-        self.log(f"train_mae", mae, prog_bar=False, on_step=True, on_epoch=True)
-        self.log(f"train_mse", mse, prog_bar=False, on_step=True, on_epoch=True)
-
-        return loss
-
-    def validation_step(self, batch, batch_idx):
-        """Validation step"""
-        x, y = batch
-
-        # Forward pass
-        predictions = self(x)
-        loss = self.criterion(predictions, y)
-
-        mae = F.l1_loss(predictions, y)
-        mse = F.mse_loss(predictions, y)
-
-        # Log metrics
-        self.log(f"val_loss", loss, prog_bar=True, on_step=False, on_epoch=True)
-        self.log(f"val_mae", mae, prog_bar=False, on_step=False, on_epoch=True)
-        self.log(f"val_mse", mse, prog_bar=False, on_step=False, on_epoch=True)
-        print(
-            f"Validation Step Batch {batch_idx}: Loss={loss.item()}, MAE={mae.item()}, MSE={mse.item()}"
-        )
-        if batch_idx == 0:
-            self.val_r2_score.reset()
-        self.val_r2_score.update(predictions, y)
-
-        self.val_predictions.append(predictions.detach().cpu().numpy())
-        self.val_targets.append(y.detach().cpu().numpy())
-
-        return loss
 
     def on_validation_epoch_end(self):
         """Called at the end of validation epoch"""
@@ -220,27 +185,98 @@ class CNet(L.LightningModule):
         super().on_validation_epoch_end()
         return val_r2
 
-    def test_step(self, batch, batch_idx):
-        """Test step"""
+    def _normalize_shapes(
+        self, preds: torch.Tensor, y: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Ensure prediction and target shapes are compatible.
+
+        - Cast to float
+        - If 1D, make (B,1) to match (B,1) convention for output_dim=1
+        """
+        y = y.float()
+        preds = preds.float()
+        if y.dim() == 1:
+            y = y.view(-1, 1)
+        if preds.dim() == 1:
+            preds = preds.view(-1, 1)
+        return preds, y
+
+    def _unpack_inputs(self, x):
+        if isinstance(x, (list, tuple)) and len(x) == 2:
+            return x[0], x[1]
+        return x, None
+
+    def _step(self, batch, stage: str, batch_idx: int):
+        """Shared step for training, validation, and testing"""
         x, y = batch
+        image_x, feature_x = self._unpack_inputs(x)
+        preds = self(image_x, feature_x)
 
-        # Forward pass
-        predictions = self(x)
-        loss = self.criterion(predictions, y)
+        preds, y = self._normalize_shapes(preds, y)
+        if preds.shape[1] == 1:
+            abs_phase_loss = torch.min(
+                torch.abs(y - preds) % (2 * torch.pi),
+                (2 * torch.pi - (torch.abs(y - preds) % (2 * torch.pi))),
+            )
+            loss = (abs_phase_loss**2).mean()
+            mae = abs_phase_loss.mean()
+            mse = (abs_phase_loss**2).mean()
+            y_hat = ((preds + torch.pi) % (2 * torch.pi)) - torch.pi
+            y_hat = torch.where(y_hat - y > np.pi, y_hat - 2 * np.pi, y_hat)
+            y_hat = torch.where(y - y_hat > np.pi, y_hat + 2 * np.pi, y_hat)
+        else:
+            loss = self.criterion(preds, y)
+            mae = F.l1_loss(preds, y)
+            mse = F.mse_loss(preds, y)
+            y_hat = preds
 
-        mae = F.l1_loss(predictions, y)
-        mse = F.mse_loss(predictions, y)
+        # Logging
+        self.log(
+            f"{stage}_loss",
+            loss,
+            prog_bar=(stage == "train"),
+            on_step=(stage == "train"),
+            on_epoch=True,
+        )
+        self.log(f"{stage}_mae", mae, prog_bar=False, on_step=False, on_epoch=True)
+        self.log(f"{stage}_mse", mse, prog_bar=False, on_step=False, on_epoch=True)
 
-        # Log metrics
-        self.log(f"test_loss", loss, prog_bar=True, on_step=False, on_epoch=True)
-        self.log(f"test_mae", mae, prog_bar=False, on_step=False, on_epoch=True)
-        self.log(f"test_mse", mse, prog_bar=False, on_step=False, on_epoch=True)
-
-        if batch_idx == 0:
-            self.test_r2_score.reset()
-        self.test_r2_score.update(predictions, y)
-
+        if stage == "train":
+            self.train_predictions.append(y_hat.detach().cpu().numpy())
+            self.train_targets.append(y.detach().cpu().numpy())
+        elif stage == "val":
+            if batch_idx == 0:
+                self.val_r2_score.reset()
+            self.val_r2_score.update(y_hat, y)
+            self.val_predictions.append(y_hat.detach().cpu().numpy())
+            self.val_targets.append(y.detach().cpu().numpy())
+            print(
+                f"Validation Step Batch {batch_idx}: Loss={loss.item()}, MAE={mae.item()}, MSE={mse.item()}"
+            )
+        elif stage == "test":
+            if batch_idx == 0:
+                self.test_r2_score.reset()
+            self.test_r2_score.update(y_hat, y)
         return loss
+
+    def training_step(self, batch, batch_idx):
+        return self._step(batch, "train", batch_idx)
+
+    def validation_step(self, batch, batch_idx):
+        return self._step(batch, "val", batch_idx)
+
+    def test_step(self, batch, batch_idx):
+        return self._step(batch, "test", batch_idx)
+
+    def predict_step(self, batch, batch_idx):
+        """Prediction step"""
+        if isinstance(batch, (list, tuple)):
+            x = batch[0]
+        else:
+            x = batch
+        image_x, feature_x = self._unpack_inputs(x)
+        predictions = self(image_x, feature_x)
+        return {"predictions": predictions}
 
     def on_test_end(self):
         """Called at the end of test epoch"""
@@ -251,13 +287,6 @@ class CNet(L.LightningModule):
         self.test_r2_score.reset()
         super().on_test_epoch_end()
         return test_r2
-
-    def predict_step(self, batch, batch_idx):
-        """Prediction step"""
-        x, _ = batch if isinstance(batch, (list, tuple)) else (batch, None)
-        predictions = self(x)
-
-        return {"predictions": predictions}
 
     def configure_optimizers(self):
         """Configure optimizer and learning rate scheduler"""
@@ -286,7 +315,7 @@ class CNet(L.LightningModule):
         if self.scheduler_name is None:
             return optimizer
         if self.scheduler_name.lower() == "plateau":
-            scheduler = ReduceLROnPlateau(optimizer, min_lr=1e-6)
+            scheduler = ReduceLROnPlateau(optimizer, min_lr=1e-6, patience=3, factor=0.7)
             return {
                 "optimizer": optimizer,
                 "lr_scheduler": {
