@@ -598,7 +598,7 @@ def run_linear_regression(
 
     count = count or sweep_config.get("count", 10) if sweep and sweep_config else None
     dataset = ModularCellFeaturesDataset(data_config=data_config)
-    train_df, test_df, val_df = dataset.split_set()
+    train_df, val_df, test_df = dataset.split_set()
     feature_names = [
         column for column in train_df.columns.tolist() if not column.startswith("label_")
     ]
