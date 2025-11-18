@@ -49,11 +49,3 @@ class DebugCallback(Callback):
                 ax[j].axis("off")
         trainer.logger.experiment.log({"sanity_check_images": wandb.Image(plt)})
         plt.close(fig)
-        if len(y.shape) == 1 or y.shape[1] == 1:
-            projector = trainer.datamodule.full_dataset.projector
-            if projector is not None:
-                curve_values = projector.point_at_phase(y.squeeze().cpu().numpy())
-                ax = projector.plot_curve(show=False)
-                ax.scatter(curve_values[:, 0], curve_values[:, 1], c="blue", s=30, marker="o")
-                trainer.logger.experiment.log({"sanity_check_curve": wandb.Image(plt)})
-                plt.close()
