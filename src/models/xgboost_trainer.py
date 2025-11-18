@@ -34,25 +34,26 @@ class XGBoostCellCycleTrainer:
     def __init__(
         self,
         training_data: pd.DataFrame,
-        train_val_split_ratio: float = 0.8,
+        val_data: pd.DataFrame,
         wandb_run: Optional[wandb.Run] = None,
-        fucci_scalers: np.ndarray = None,
+        dataset: ModularCellFeaturesDataset = None,
     ):
         """Initialize trainer with data configuration.
 
         Args:
-            data_config_path: Path to data configuration YAML
-            use_wandb: Whether to log to Weights & Biases
+            training_data: Training data as a pandas DataFrame
+            val_data: Validation data as a pandas DataFrame
+            wandb_run: Optional W&B run object for logging
+            dataset: ModularCellFeaturesDataset for feature target splitting
         """
         self.training_data = training_data
+        self.val_data = val_data
+        self.dataset = dataset
         self.features_columns = [
             col for col in training_data.columns if not col.startswith("label_")
         ]
         self.wandb_run = wandb_run
-        self.fucci_scalers = fucci_scalers
-        if self.fucci_scalers is None:
-            self.fucci_scalers = np.array(1.0, 1.0)
-        self.train_val_split_ratio = train_val_split_ratio
+
         self.model = None
         self.X_train = None
         self.y_train = None
@@ -69,10 +70,8 @@ class XGBoostCellCycleTrainer:
         self.wandb_run = wandb_run
 
     def prepare_dataset(self) -> Tuple[np.ndarray, np.ndarray]:
-        X_train, y_train = ModularCellFeaturesDataset.split_X_y(self.training_data)
-        X_train, y_train, X_val, y_val = train_val_split(
-            X_train, y_train, self.train_val_split_ratio, random_state=42
-        )
+        X_train, y_train = self.dataset.split_X_y(self.training_data)
+        X_val, y_val = self.dataset.split_X_y(self.val_data)
 
         self.X_train = X_train
         self.y_train = y_train
@@ -108,20 +107,33 @@ class XGBoostCellCycleTrainer:
         self.log_feature_importance()
         return self.model, metrics
 
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        """Make predictions using the trained model.
+
+        Args:
+            X: Input features
+
+        Returns:
+            Predictions
+        """
+        if self.model is None:
+            raise ValueError("Model not trained yet")
+        return self.model.predict(X)
+
     def evaluate(self) -> Dict[str, float]:
         metrics = {}
 
         train_metrics = evaluate_regression(
-            self.y_train * self.fucci_scalers,
-            self.model.predict(self.X_train) * self.fucci_scalers,
+            self.y_train,
+            self.model.predict(self.X_train),
             prefix="train",
             wandb_run=self.wandb_run,
             plot=False,
         )
         metrics.update(train_metrics)
         val_metrics = evaluate_regression(
-            self.y_val * self.fucci_scalers,
-            self.model.predict(self.X_val) * self.fucci_scalers,
+            self.y_val,
+            self.model.predict(self.X_val),
             prefix="val",
             wandb_run=self.wandb_run,
             plot=True,
