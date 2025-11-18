@@ -1,17 +1,5 @@
 """
-FUCCI label generator: maps 2D intensity points (label_488, label_561)
-to a smooth reference cell-cycle curve and returns the phase on [0, 2π).
-
-Implements:
-- Compute centroid-centered angles for points
-- Bin by angle, average within bins to form a closed curve
-- Smooth curve with periodic Gaussian filter
-- Interpolate curve (x(t), y(t)) over t ∈ [0, 2π)
-- Project points to nearest curve location to get phases
-
-Extras provided here:
-- fit_from_dataset(dataset, ...) to build curve directly from a Dataset producing labels
-- Caching: avoid recomputing the phase curve using a deterministic cache key
+FUCCI label projector: projects 2D intensity points (label_488, label_561)
 """
 
 from __future__ import annotations
@@ -25,8 +13,6 @@ import hashlib
 from networkx import radius
 from tqdm import tqdm
 import numpy as np
-from scipy.ndimage import gaussian_filter1d
-from scipy.interpolate import interp1d
 
 try:
     # Prefer project utilities if available for stable hashing
@@ -35,59 +21,26 @@ except Exception:  # pragma: no cover
     make_hash_from_dict = None  # Fallback to hashlib if not available
 
 
-@dataclass
-class FucciLabelGeneratorConfig:
-    M: int = 100  # number of phase bins for the reference curve
-    sigma: float = 2.0  # smoothing sigma for gaussian_filter1d
-    n_samples: int = 1000  # samples along curve for nearest-search
-    feature_cols: Tuple[str, str] = ("label_488", "label_561")
-
-
 class FucciCurveProjector:
-    """Project FUCCI intensities to phases by projecting 2D intensity points onto a smooth reference curve.
-
-    API:
-        fit(points): build the reference curve and interpolants
-        transform(points): -> (phases (N,), projected_points (N,2))
-        fit_transform(points): convenience fit + transform
-        plot_reference_curve / plot_mapping: optional visualization
-    """
+    """Project FUCCI intensities to phases by projecting 2D intensity points onto a smooth reference curve."""
 
     def __init__(
         self,
         dataset: Any,
-        M: int = 100,
-        sigma: float = 2.0,
-        n_samples: int = 1000,
         feature_cols: Tuple[str, str] = ("label_488", "label_561"),
         default_cache_dir: Optional[str] = None,
     ):
-        self.config = FucciLabelGeneratorConfig(
-            M=M, sigma=sigma, n_samples=n_samples, feature_cols=feature_cols
-        )
+        self.feature_cols = feature_cols
         self.dataset = dataset
         # Learned artifacts after fit
         self.centroid: Optional[np.ndarray] = None
-        # self.t_uniform: Optional[np.ndarray] = None
-        # self.curve_points: Optional[np.ndarray] = None  # (M,2)
-        # self._interp_x = None
-        # self._interp_y = None
         self.default_cache_dir = Path(default_cache_dir) if default_cache_dir else None
 
-    # -----------------------------
-    # Public API
-    # -----------------------------
     def fit(self, points) -> "FucciCurveProjector":
         print("⟳ Fitting FUCCI curve projector…")
-        P = _as_points(points, self.config.feature_cols)
-        # (
-        #     self.t_uniform,
-        #     self.curve_points,
-        #     self._interp_x,
-        #     self._interp_y,
-        #     self.centroid,
-        # ) = self._compute_phase_curve(P, M=self.config.M, sigma=self.config.sigma)
+        P = _as_points(points, self.feature_cols)
         self.centroid, self.radius = self._fit_cycle_center(P)
+        # self.theta_1, self.theta_2, self.theta_3, self.c1, self.c2, self.c3 = self._fit_triangle(P)
         return self
 
     def project(self, intensities) -> Tuple[float, np.ndarray]:
@@ -111,31 +64,6 @@ class FucciCurveProjector:
             self.centroid[1] + radius * np.sin(phase),
         ]
 
-    def point_at_phase(self, phase) -> np.ndarray:
-        """Map a phase value (or array of phases) in radians back to 2D coordinates on the curve.
-
-        Args:
-            phase: float or array-like of phases in radians. Values can be outside [0, 2π);
-                   they'll be wrapped into that range.
-
-        Returns:
-            If input is scalar: np.ndarray with shape (2,) for the (x, y) point.
-            If input is array-like of shape (N,): np.ndarray with shape (N, 2).
-        """
-        self._ensure_fitted()
-
-        p = np.asarray(phase, dtype=float)
-        p = (p + 2 * np.pi) % (2 * np.pi)
-
-        if p.ndim == 0:
-            x = float(self._interp_x(p))
-            y = float(self._interp_y(p))
-            return np.array([x, y], dtype=float)
-        else:
-            x = self._interp_x(p)
-            y = self._interp_y(p)
-            return np.stack([x, y], axis=-1).astype(float)
-
     def fit_from_dataset(
         self,
         use_cache: bool = True,
@@ -156,7 +84,7 @@ class FucciCurveProjector:
         # Build a cache key for the raw extracted points
         ds_len = len(self.dataset)
         pts_key_params: Dict[str, Any] = {
-            "feature_cols": list(self.config.feature_cols),
+            "feature_cols": list(self.feature_cols),
             "dataset_len": ds_len,
             "datasource": getattr(self.dataset, "data_source", self.dataset).__class__.__name__,
         }
@@ -169,65 +97,68 @@ class FucciCurveProjector:
         if use_cache and pts_cache_path.exists():
             data = np.load(pts_cache_path, allow_pickle=False)
             P = data["points"]
-            # print(f"✓ Loaded FUCCI points from cache: {pts_cache_path}")
         else:
             print("⟳ Extracting FUCCI intensity points from dataset…")
             P = self._extract_points_from_dataset(self.dataset)
             if use_cache:
                 np.savez_compressed(pts_cache_path, points=P)
-                # print(f"✓ Saved FUCCI points cache: {pts_cache_path}")
-
-        # Curve cache depends on parameters (M, sigma) and the points content
-        # Create a short digest of points; avoid full JSON by hashing bytes
-        # pts_digest = hashlib.md5(P.tobytes()).hexdigest()[:12]
-        # curve_key_params: Dict[str, Any] = {
-        #     "M": self.config.M,
-        #     "sigma": self.config.sigma,
-        #     "points_digest": pts_digest,
-        # }
-        # curve_key = _hash_dict(curve_key_params)
-        # curve_cache_path = cdir / f"fucci_curve_{curve_key}.npz"
-
-        # if use_cache and curve_cache_path.exists():
-        #     data = np.load(curve_cache_path, allow_pickle=False)
-        #     self.t_uniform = data["t_uniform"]
-        #     self.curve_points = data["curve_points"]
-        #     self.centroid = data["centroid"]
-        #     # rebuild interpolants
-        #     self._interp_x = interp1d(
-        #         self.t_uniform,
-        #         self.curve_points[:, 0],
-        #         kind="cubic",
-        #         fill_value="extrapolate",
-        #         assume_sorted=True,
-        #     )
-        #     self._interp_y = interp1d(
-        #         self.t_uniform,
-        #         self.curve_points[:, 1],
-        #         kind="cubic",
-        #         fill_value="extrapolate",
-        #         assume_sorted=True,
-        #     )
-        #     print(f"✓ Loaded FUCCI curve from cache: {curve_cache_path}")
-        #     return self
 
         # Compute curve from points
         print("⟳ Computing FUCCI reference curve from points…")
         self.fit(P)
 
-        # if use_cache:
-        #     np.savez_compressed(
-        #         curve_cache_path,
-        #         t_uniform=self.t_uniform,
-        #         curve_points=self.curve_points,
-        #         centroid=self.centroid,
-        #     )
-        #     print(f"✓ Saved FUCCI curve cache: {curve_cache_path}")
         return self
 
     # -----------------------------
     # Core implementation
     # -----------------------------
+    @staticmethod
+    def _fit_triangle(points: np.ndarray) -> Tuple[float, float, float, float, float, float]:
+        import numpy as np
+        from scipy import optimize
+
+        # Function to calculate distance from each point to the three lines
+        def calc_distances(theta_1, theta_2, theta_3, c1, c2, c3):
+            # Perpendicular vectors (normals to the lines)
+            n1 = np.array([-np.sin(theta_1), np.cos(theta_1)])
+            n2 = np.array([-np.sin(theta_2), np.cos(theta_2)])
+            n3 = np.array([-np.sin(theta_3), np.cos(theta_3)])
+
+            # Distance from each point to each line: |n · p + c|
+            d1 = np.abs(points @ n1 + c1)
+            d2 = np.abs(points @ n2 + c2)
+            d3 = np.abs(points @ n3 + c3)
+
+            d = np.stack([d1, d2, d3], axis=1)  # (N, 3)
+            # For each point, take the minimum distance to any of the three lines
+            min_distances = np.min(d, axis=1)
+            return min_distances
+
+        # Residual function: array of distances for leastsq
+        def residuals(params):
+            return calc_distances(*params)
+
+        # Initial guess for three vectors forming a triangular shape
+        theta_1_init = 1 * np.pi / 2  # towards low 488, high 561 (G1 region)
+        theta_2_init = 3 * np.pi / 10  # 144° - towards low 488, high 561 (G1 region)
+        theta_3_init = 1 * np.pi / 6  # 30° - bottom region
+
+        # Initial constants (offset from origin)
+        c1_init = 7.3
+        c2_init = 1.0
+        c3_init = -1.4
+
+        initial_guess = np.array(
+            [theta_1_init, theta_2_init, theta_3_init, c1_init, c2_init, c3_init]
+        )
+
+        # Least squares optimization to find optimal parameters
+        result, ier = optimize.leastsq(residuals, initial_guess, maxfev=20000)
+
+        theta_1, theta_2, theta_3, c1, c2, c3 = result
+
+        return theta_1, theta_2, theta_3, c1, c2, c3
+
     @staticmethod
     def _fit_cycle_center(points: np.ndarray) -> np.ndarray:
         import numpy as np
@@ -257,120 +188,135 @@ class FucciCurveProjector:
         radius = radius
         return centroid, radius
 
-    @staticmethod
-    def _compute_phase_curve(points: np.ndarray, M: int = 200, sigma: float = 2.0):
-        # Remove points with any negative values
-        points = points[(points[:, 0] >= 0) & (points[:, 1] >= 0)]
-        # Centroid and polar angles for binning
-        # centroid = points.mean(axis=0)
-        # def _geometric_median(P, eps=1e-6, max_iter=256):
-
-        #     for _ in range(max_iter):
-        #         d = np.linalg.norm(P , axis=1)
-        #         if np.any(d == 0):
-        #             return P[d == 0][0]
-        #         w = 1.0 / np.clip(d, 1e-12, None)
-        #         x_new = (P * w[:, None]).sum(axis=0) / w.sum()
-        #         x = x_new
-        #     return x
-
-        # centroid = _geometric_median(points)
-        def fit_circle(points):
-            import numpy as np
-            from scipy import optimize
-
-            # Function to calculate distance from center (xc, yc) to each point
-            def calc_R(xc, yc, r):
-                return np.sqrt((points[:, 0] - xc) ** 2 + (points[:, 1] - yc) ** 2) - r
-
-            # Residual function: difference between each point's distance and mean distance (radius)
-            def residuals(c):
-                Ri = calc_R(*c)
-                return Ri
-
-            # Initial guess: mean of points as center
-            center_estimate = np.mean(points, axis=0)
-            radius_estimate = np.mean(
-                np.sqrt(
-                    (points[:, 0] - center_estimate[0]) ** 2
-                    + (points[:, 1] - center_estimate[1]) ** 2
-                )
-            )
-            initial_guess = (center_estimate[0], center_estimate[1], radius_estimate)
-            # Least squares optimization to find center
-            center_opt, ier = optimize.leastsq(residuals, initial_guess)
-
-            return center_opt, radius_estimate
-
-        (centroid, radius), _ = fit_circle(points)
-        angles = np.arctan2(points[:, 1] - centroid[1], points[:, 0] - centroid[0])
-        angles = (angles + 2 * np.pi) % (2 * np.pi)
-
-        # Phase bins and mean per bin
-        phase_bins = np.linspace(0.0, 2 * np.pi, M + 1)
-        curve_points = np.zeros((M, 2), dtype=np.float64)
-        for i in range(M):
-            mask = (angles >= phase_bins[i]) & (angles < phase_bins[i + 1])
-            if mask.sum() > 0:
-                curve_points[i] = points[mask].mean(axis=0)
-            else:
-                # If no points in bin, repeat previous point (or mean if first)
-                curve_points[i] = curve_points[i - 1] if i > 0 else points.mean(axis=0)
-
-        # Smooth with periodic gaussian filter (wrap mode)
-        curve_points[:, 0] = gaussian_filter1d(curve_points[:, 0], sigma=sigma, mode="wrap")
-        curve_points[:, 1] = gaussian_filter1d(curve_points[:, 1], sigma=sigma, mode="wrap")
-
-        # Build cubic interpolants over uniform t in [0, 2π)
-        t_uniform = np.linspace(0.0, 2 * np.pi, M, endpoint=False)
-        interp_x = interp1d(
-            t_uniform,
-            curve_points[:, 0],
-            kind="cubic",
-            fill_value="extrapolate",
-            assume_sorted=True,
-        )
-        interp_y = interp1d(
-            t_uniform,
-            curve_points[:, 1],
-            kind="cubic",
-            fill_value="extrapolate",
-            assume_sorted=True,
-        )
-        return t_uniform, curve_points, interp_x, interp_y, centroid
-
-    @staticmethod
-    def _map_point_to_curve(
-        point: np.ndarray, interp_x, interp_y, n_samples: int = 2000
-    ) -> Tuple[np.ndarray, float]:
-        """Map a single 2D point to the closest point on the interpolated curve.
-
-        Args:
-            point: shape (2,)
-        Returns:
-            projected_point: shape (2,)
-            phase: float in [0, 2π)
-        """
-        pt = np.asarray(point, dtype=float).reshape(-1)
-        if pt.shape[0] != 2:
-            raise ValueError(f"Expected a single 2D point, got shape {pt.shape}")
-
-        ts = np.linspace(0.0, 2 * np.pi, n_samples, endpoint=True)
-        curve_eval = np.stack([interp_x(ts), interp_y(ts)], axis=1)  # (n_samples, 2)
-
-        # Compute squared distances to each sampled curve point
-        diffs = curve_eval - pt[None, :]  # (n_samples, 2)
-        dists2 = np.sum(diffs * diffs, axis=1)  # (n_samples,)
-        idx = int(np.argmin(dists2))  # scalar index
-
-        projected = curve_eval[idx]
-        phase = ts[idx]
-        phase = float((phase + 2 * np.pi) % (2 * np.pi))
-        return projected, phase
-
     # -----------------------------
     # Plotting helpers
     # -----------------------------
+    def plot_triangle(
+        self,
+        ax=None,
+        show: bool = True,
+        color: str = "green",
+        lw: float = 2.0,
+        intensity_points: Optional[np.ndarray] = None,
+        plot_random_projections: bool = False,
+    ):
+        """Plot the fitted reference triangle.
+
+        Args:
+            ax: Matplotlib Axes; if None, uses current axes
+            show: Call plt.show() when done
+            color: Line color for the triangle edges
+            lw: Line width for the triangle
+            intensity_points: Optional array-like of shape (N,2) to plot as gray points
+            plot_random_projections: Whether to add random points and plot their projections to the triangle
+
+        Returns:
+            The Matplotlib Axes with the plot
+        """
+        import matplotlib.pyplot as plt
+
+        self._ensure_fitted()
+
+        # Extract triangle parameters from attributes
+        theta_1 = self.theta_1
+        theta_2 = self.theta_2
+        theta_3 = self.theta_3
+
+        c1 = self.c1
+        c2 = self.c2
+        c3 = self.c3
+        print(f"Triangle parameters:")
+        print(f"  θ1: {np.degrees(theta_1):.1f}°")
+        print(f"  θ2: {np.degrees(theta_2):.1f}°")
+        print(f"  θ3: {np.degrees(theta_3):.1f}°")
+        print(f"  c1: {c1:.1f}")
+        print(f"  c2: {c2:.1f}")
+        print(f"  c3: {c3:.1f}")
+        # Create normal vectors (perpendicular to each edge)
+        n1 = np.array([-np.sin(theta_1), np.cos(theta_1)])
+        n2 = np.array([-np.sin(theta_2), np.cos(theta_2)])
+        n3 = np.array([-np.sin(theta_3), np.cos(theta_3)])
+
+        ax = ax or plt.gca()
+
+        # Estimate a suitable scale based on the data range
+        if intensity_points is not None:
+            pts = _as_points(intensity_points, self.feature_cols)
+            pts = pts[(pts[:, 0] >= 0) & (pts[:, 1] >= 0)]
+            center = pts.mean(axis=0)
+            scale = max(pts.max(axis=0) - pts.min(axis=0)) * 1.0
+        else:
+            center = np.array([0, 0])
+            scale = 1.0
+
+        # Draw the three lines (edges of the triangle)
+        # Each line is defined by: n · p + c = 0
+        # We can rewrite as: n1*x + n2*y + c = 0  =>  y = -(n1*x + c)/n2
+        for i, (n, c_val, theta, color) in enumerate(
+            [
+                (n1, c1, theta_1, "yellow"),
+                (n2, c2, theta_2, "darkred"),
+                (n3, c3, theta_3, "darkgreen"),
+            ]
+        ):
+            angle_deg = np.degrees(theta)
+            # Create a line perpendicular to normal n
+            # Direction along the line (perpendicular to normal)
+            line_dir = np.array([n[1], -n[0]])  # Rotate normal by 90°
+
+            # Find a point on the line: n · p + c = 0
+            # Choose p such that it's near the center
+            if abs(n[1]) > abs(n[0]):
+                # Solve for y: n[1]*y = -c - n[0]*center[0]
+                p_on_line = np.array([center[0], -(c_val + n[0] * center[0]) / n[1]])
+            else:
+                # Solve for x: n[0]*x = -c - n[1]*center[1]
+                p_on_line = np.array([-(c_val + n[1] * center[1]) / n[0], center[1]])
+
+            # Draw line through p_on_line in direction line_dir
+            t = np.linspace(-scale, scale, 100)
+            line_x = p_on_line[0] + t * line_dir[0]
+            line_y = p_on_line[1] + t * line_dir[1]
+
+            ax.plot(
+                line_x,
+                line_y,
+                "-",
+                color=color,
+                lw=lw,
+                # label=(
+                #     f"Edge {i+1} (θ={angle_deg:.1f}°)"
+                #     if i == 0
+                #     else f"Edge {i+1} (θ={angle_deg:.1f}°)"
+                # ),
+            )
+
+        # Plot intensity points if provided
+        if intensity_points is not None:
+            ax.scatter(
+                pts[:, 0],
+                pts[:, 1],
+                s=10,
+                c="gray",
+                alpha=0.5,
+                # label="Intensity points",
+            )
+
+            if plot_random_projections:
+                # For triangle projection, we'd need to implement point-to-triangle projection
+                # This is more complex than circle projection
+                print("Warning: plot_random_projections not yet implemented for triangle")
+
+        ax.set_aspect("equal", adjustable="box")
+        ax.set_xlabel("FUCCI 488nm intensity")
+        ax.set_ylabel("FUCCI 561nm intensity")
+        ax.legend(loc="best")
+
+        if show:
+            plt.show()
+
+        return ax
+
     def plot_circle(
         self,
         ax=None,
@@ -413,8 +359,45 @@ class FucciCurveProjector:
         ax.scatter(
             self.centroid[0], self.centroid[1], c="black", marker="x", s=60, label="Centroid"
         )
+
+        # Add phase annotations around the circle
+        phase_labels = [
+            (0, "0"),
+            (np.pi / 4, "π/4"),
+            (np.pi / 2, "π/2"),
+            (3 * np.pi / 4, "3π/4"),
+            (np.pi, "π"),
+            (-np.pi / 2, "-π/2"),
+            (-np.pi / 4, "-π/4"),
+            (-3 * np.pi / 4, "-3π/4"),
+        ]
+
+        for phase, label in phase_labels:
+            # Position on the circle
+            px = self.centroid[0] + radius * np.cos(phase)
+            py = self.centroid[1] + radius * np.sin(phase)
+
+            # Offset for text (slightly outside the circle)
+            text_offset = 1.2
+            tx = self.centroid[0] + radius * text_offset * np.cos(phase)
+            ty = self.centroid[1] + radius * text_offset * np.sin(phase)
+
+            # Plot marker on circle
+            ax.scatter(px, py, c="blue", marker="o", s=40, zorder=5)
+
+            # Add text label
+            ax.text(
+                tx,
+                ty,
+                label,
+                fontsize=10,
+                ha="center",
+                va="center",
+                bbox=dict(boxstyle="round,pad=0.3", facecolor="white", edgecolor="black", alpha=1),
+            )
+
         if intensity_points is not None:
-            pts = _as_points(intensity_points, self.config.feature_cols)
+            pts = _as_points(intensity_points, self.feature_cols)
             pts = pts[(pts[:, 0] >= 0) & (pts[:, 1] >= 0)]
             ax.scatter(
                 pts[:, 0],
@@ -454,127 +437,6 @@ class FucciCurveProjector:
             plt.show()
         return ax
 
-    # def plot_curve(
-    #     self,
-    #     ax=None,
-    #     show: bool = True,
-    #     color: str = "crimson",
-    #     lw: float = 2.0,
-    #     plot_centroid: bool = False,
-    #     markers: bool = False,
-    #     n_markers: int = 0,
-    #     intensity_points: Optional[np.ndarray] = None,
-    #     plot_random_projections: bool = False,
-    # ):
-    #     """Plot the fitted reference curve (and optionally the centroid and markers).
-
-    #     Args:
-    #         ax: Matplotlib Axes; if None, uses current axes
-    #         show: Call plt.show() when done
-    #         color: Line color for the curve
-    #         lw: Line width for the curve
-    #         plot_centroid: Whether to plot the centroid used for angle computation
-    #         markers: Whether to draw small markers along the curve
-    #         n_markers: If >0, place this many evenly spaced markers along the curve
-
-    #     Returns:
-    #         The Matplotlib Axes with the plot
-    #     """
-    #     import matplotlib.pyplot as plt
-
-    #     self._ensure_fitted()
-    #     ax = ax or plt.gca()
-    #     # Add random points and plot their projections to the curve
-    #     rng = np.random.default_rng(42)
-    #     n_rand = 10
-    #     rand_pts = rng.uniform(0, 10, size=(n_rand, 2))
-    #     # Plot the reference curve
-    #     ax.plot(
-    #         self.curve_points[:, 0],
-    #         self.curve_points[:, 1],
-    #         "-",
-    #         color=color,
-    #         lw=lw,
-    #         label="Cell cycle curve",
-    #     )
-
-    #     # Optional centroid
-    #     if plot_centroid and self.centroid is not None:
-    #         # Improved center: mean of smoothed curve
-    #         center_curve_mean = self.curve_points.mean(axis=0)
-
-    #         # Optional robust center (geometric median); fallback to mean if iteration fails
-    #         def _geometric_median(P, eps=1e-6, max_iter=256):
-    #             x = center_curve_mean.copy()
-    #             for _ in range(max_iter):
-    #                 d = np.linalg.norm(P , axis=1)
-    #                 if np.any(d == 0):
-    #                     return P[d == 0][0]
-    #                 w = 1.0 / np.clip(d, 1e-12, None)
-    #                 x_new = (P * w[:, None]).sum(axis=0) / w.sum()
-    #                 if np.linalg.norm(x_new - x) < eps:
-    #                     return x_new
-    #                 x = x_new
-    #             return x
-
-    #         # try:
-    #         #     self.centroid = _geometric_median(self.curve_points)
-    #         # except Exception:
-    #         #     self.centroid = center_curve_mean
-    #         ax.scatter(
-    #             [self.centroid[0]],
-    #             [self.centroid[1]],
-    #             marker="x",
-    #             s=60,
-    #             c="black",
-    #             label="Centroid",
-    #         )
-    #         ax.set_xlabel("FUCCI 488nm intensity")
-    #         ax.set_ylabel("FUCCI 561nm intensity")
-
-    #     # Optional markers
-    #     if markers or n_markers > 0:
-    #         if n_markers <= 0:
-    #             n_markers = 8
-    #         idxs = np.linspace(0, len(self.curve_points) - 1, n_markers, dtype=int)
-    #         ax.scatter(
-    #             self.curve_points[idxs, 0],
-    #             self.curve_points[idxs, 1],
-    #             s=20,
-    #             c=color,
-    #             edgecolors="black",
-    #             linewidths=0.6,
-    #             zorder=3,
-    #             label=None,
-    #         )
-    #     if intensity_points is not None:
-    #         pts = _as_points(intensity_points, self.config.feature_cols)
-    #         pts = pts[(pts[:, 0] >= 0) & (pts[:, 1] >= 0)]
-    #         ax.scatter(
-    #             pts[:, 0],
-    #             pts[:, 1],
-    #             s=10,
-    #             c="gray",
-    #             alpha=0.5,
-    #             label="Intensity points",
-    #         )
-    #     ax.set_aspect("equal", adjustable="box")
-    #     ax.legend(loc="best")
-    #     if plot_random_projections:
-    #         for pt in rand_pts:
-    #             projected, phase = self._map_point_to_curve(
-    #                 pt, self._interp_x, self._interp_y, n_samples=self.config.n_samples
-    #             )
-    #             ax.plot([pt[0], projected[0]], [pt[1], projected[1]], "b--", lw=1, alpha=0.7)
-    #             ax.scatter([pt[0]], [pt[1]], c="blue", s=30, marker="o", label=None)
-    #             ax.scatter([projected[0]], [projected[1]], c="red", s=30, marker="x", label=None)
-    #     if show:
-    #         plt.show()
-    #     return ax
-
-    # -----------------------------
-    # Internals
-    # -----------------------------
     def _ensure_fitted(self):
         # if self.curve_points is None or self._interp_x is None or self._interp_y is None:
         if self.centroid is None:
