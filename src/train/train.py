@@ -65,9 +65,10 @@ import wandb
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from src.models.cnet import CNet
+from src.models.cnet import CNet, ABSResiduals
 from src.models.mlp import MLP
-from src.train.utils import evaluate_regression, train_val_split
+from src.evaluation.evaluator import Evaluator
+from src.train.utils import log_regression_plots
 from src.models.xgboost_trainer import XGBoostCellCycleTrainer
 from src.data_pipeline.dataset import (
     ModularCellDataModule,
@@ -145,19 +146,6 @@ def parse_args():
         "linear",
         parents=[common_parser],
         help="Train with Linear Regression (sklearn) and evaluate on validation/test sets",
-    )
-
-    # Experiment backend
-    dataset_size_experiment = subparsers.add_parser(
-        "dataset_size_experiment",
-        parents=[common_parser],
-        help="Run dataset size experiment",
-    )
-    dataset_size_experiment.add_argument(
-        "--steps",
-        type=int,
-        default=2000,
-        help="Step size for increasing dataset size in the experiment",
     )
 
     linear_parser.add_argument(
@@ -252,43 +240,6 @@ def create_model(model_config: Optional[Dict[str, Any]]):
     return model
 
 
-def run_dataset_size_experiment(config, steps):
-    """
-    Run experiments to evaluate the effect of dataset size on model performance.
-
-    Args:
-        config: Configuration dictionary
-        experiment_name: Name of the experiment for logging
-    """
-    data_config = config.get("data")
-    trainer_config = config.get("trainer")
-    datamodule = ModularCellDataModule(
-        data_config_path=data_config.get("data_config_path"),
-    )
-    datamodule.setup()
-    len_dataset = len(datamodule.train_dataset)
-    nr_dataset_batches = len(datamodule.train_dataloader())
-    for dataset_size in range(steps, len_dataset, steps):
-        print("\n" + "=" * 80)
-        print(f"Running experiment with dataset size: {dataset_size}")
-        print("=" * 80 + "\n")
-        # Here you would implement the logic to train and evaluate the model
-        # using only 'dataset_size' number of samples from the training set.
-        # This function can be expanded based on specific experiment requirements.
-        nr_batches = dataset_size // datamodule.batch_size
-        dataset_batch_fraction = nr_batches / nr_dataset_batches
-        print(f"Using {nr_batches} batches ({dataset_batch_fraction:.2%} of full dataset)")
-        # Example: You might want to modify the datamodule or dataloader
-        data_config.update({"train_dataset_size": dataset_size})
-        trainer_config.update({"overfit_batches": dataset_batch_fraction})
-        run_lightning(
-            config,
-            experiment_name=f"dataset_size_{dataset_size}",
-        )
-
-    # This function can be implemented to run experiments varying dataset sizes
-
-
 def run_lightning(
     config: Dict, experiment_name: Optional[str] = None, project_name: Optional[str] = None
 ):
@@ -329,6 +280,7 @@ def run_lightning(
     datamodule = ModularCellDataModule(
         data_config_path=data_config_path,
     )
+    datamodule.setup()
 
     model = create_model(model_config)
 
@@ -443,8 +395,8 @@ def train_and_evaluate_xgboost(
     if wandb_run:
         trainer.set_wandb_run(wandb_run)
     print("\nTraining XGBoost model...")
-    model, metrics = trainer.train(params=params)
-
+    evaluator = Evaluator()
+    model, metrics = trainer.train(params=params, evaluator=evaluator)
     model_path = None
     if save_model:
         model_path = f"checkpoints/xgboost/xgboost{model_suffix}_val_r2_{metrics['val_r2']:.4f}_val_mae_{metrics['val_mae']:.4f}.json"
@@ -452,18 +404,16 @@ def train_and_evaluate_xgboost(
         trainer.save_model(model_path)
 
     if test_X is not None and test_y is not None:
-        test_metrics = evaluate_regression(
+        test_evaluation = evaluator.evaluate(
             test_y,
             trainer.predict(test_X),
             prefix="test",
-            plot=False,
-            wandb_run=wandb_run,
         )
         print(f"\nTest Metrics:")
-        for k, v in test_metrics.items():
+        for k, v in test_evaluation.metrics.to_dict(prefix="test").items():
             print(f"  {k}: {v:.4f}")
     else:
-        test_metrics = None
+        test_evaluation = None
 
     if model_path:
         print(f"\n✓ Model saved to {model_path}")
@@ -475,7 +425,7 @@ def train_and_evaluate_xgboost(
     )
     artifact.add_file(str(model_path))
     wandb_run.log_artifact(artifact)
-    return trainer, metrics, test_metrics, model_path
+    return trainer, metrics, test_evaluation.metrics.to_dict(prefix="test"), model_path
 
 
 def run_xgboost(config: dict, project_name: str):
@@ -606,8 +556,10 @@ def run_linear_regression(
     X_val, y_val = dataset.split_X_y(val_df)
     X_test, y_test = dataset.split_X_y(test_df)
 
+    evaluator = Evaluator()
+
     def train_trial(trial_config, wandb_run, model=model):
-        # Use config from sweep or default
+        # Use config from W&B sweep
         params = trial_config
         alpha = params.get("alpha")
         model = model(alpha=alpha)
@@ -616,43 +568,44 @@ def run_linear_regression(
         val_preds = model.predict(X_val)
         train_preds = model.predict(X_train)
         metrics = {}
-        train_metrics = evaluate_regression(
+        train_evaluation = evaluator.evaluate(
             y_train,
             train_preds,
             prefix="train",
-            plot=False,
-            wandb_run=wandb_run,
         )
-        metrics.update(train_metrics)
-        val_metrics = evaluate_regression(
+        metrics.update(train_evaluation.metrics.to_dict(prefix="train"))
+        val_evaluation = evaluator.evaluate(
             y_val,
             val_preds,
             prefix="val",
-            plot=True,
-            wandb_run=wandb_run,
         )
-        metrics.update(val_metrics)
-        test_metrics = evaluate_regression(
+
+        metrics.update(val_evaluation.metrics.to_dict(prefix="val"))
+        test_evaluation = evaluator.evaluate(
             y_test,
             model.predict(X_test),
             prefix="test",
-            plot=False,
-            wandb_run=wandb_run,
         )
+        metrics.update(test_evaluation.metrics.to_dict(prefix="test"))
         importance = np.abs(model.coef_)
         importance_df = pd.DataFrame(
             data=importance,
             columns=feature_names,
             index=["488", "561"],
         )
-
-        wandb.log({"feature_importance": wandb.Table(dataframe=importance_df)})
+        wandb.log(**metrics)
+        for plot_name, fig in train_evaluation.plots.items():
+            wandb_run.log({f"{plot_name}": wandb.Image(fig)})
+            fig.clf()
+        for plot_name, fig in val_evaluation.plots.items():
+            wandb_run.log({f"{plot_name}": wandb.Image(fig)})
+            fig.clf()
         print(f"{model_name} Regression Validation Results:")
         print(f"MSE: {metrics['val_mse']:.4f}")
         print(f"MAE: {metrics['val_mae']:.4f}")
         print(f"R2: {metrics['val_r2']:.4f}")
         print(f"\nTest Metrics:")
-        for k, v in test_metrics.items():
+        for k, v in test_evaluation.metrics.to_dict(prefix="test").items():
             print(f"  {k}: {v:.4f}")
 
     if sweep and sweep_config is not None:
@@ -721,9 +674,6 @@ def main():
             )
         else:
             run_linear_regression(config)
-    elif args.backend == "dataset_size_experiment":
-        run_dataset_size_experiment(config, steps=args.steps)
-
     else:
         raise ValueError(f"Unknown backend: {args.backend}")
 
