@@ -11,7 +11,6 @@ from xgboost import XGBRegressor
 from typing import Dict, Any, Optional, Tuple, List
 import pandas as pd
 from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
-import yaml
 
 try:
     import wandb
@@ -22,7 +21,9 @@ except ImportError:
 sys.path.append(str(Path(__file__).resolve().parent.parent.parent))
 
 from src.data_pipeline.dataset import ModularCellFeaturesDataset
-from src.train.utils import evaluate_regression, train_val_split
+from src.evaluation.evaluation import evaluate_regression
+from src.train.utils import log_regression_plots
+from src.evaluation.evaluator import Evaluator
 
 
 class XGBoostCellCycleTrainer:
@@ -35,6 +36,7 @@ class XGBoostCellCycleTrainer:
         self,
         training_data: pd.DataFrame,
         val_data: pd.DataFrame,
+        evaluator: Evaluator,
         wandb_run: Optional[wandb.Run] = None,
         dataset: ModularCellFeaturesDataset = None,
     ):
@@ -123,22 +125,24 @@ class XGBoostCellCycleTrainer:
     def evaluate(self) -> Dict[str, float]:
         metrics = {}
 
-        train_metrics = evaluate_regression(
+        train_evaluation = self.evaluator.evaluate(
             self.y_train,
             self.model.predict(self.X_train),
             prefix="train",
             wandb_run=self.wandb_run,
             plot=False,
         )
-        metrics.update(train_metrics)
-        val_metrics = evaluate_regression(
+        metrics.update(train_evaluation.metrics.to_dict(prefix="train"))
+        val_evaluation = self.evaluator.evaluate(
             self.y_val,
             self.model.predict(self.X_val),
             prefix="val",
             wandb_run=self.wandb_run,
-            plot=True,
         )
-        metrics.update(val_metrics)
+        metrics.update(val_evaluation.metrics.to_dict(prefix="val"))
+        for plot_name, fig in val_evaluation.plots.items():
+            self.wandb_run.log({f"{plot_name}": wandb.Image(fig)})
+            fig.clf()
         return metrics
 
     def log_feature_importance(self):
