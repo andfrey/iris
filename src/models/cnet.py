@@ -1,17 +1,14 @@
 """
 CNet - Convolutional Neural Network for Cell Image FUCCI Intensity Regression
+
+Inherits training logic from BaseRegressionModel.
 """
 
-import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-import lightning as L
-from torch.optim import Adam, AdamW, SGD
-from torch.optim.lr_scheduler import ReduceLROnPlateau, CosineAnnealingLR, StepLR
-from torcheval.metrics import R2Score
-from typing import Optional, Dict, Any, List, Tuple
-from src.train.utils import log_plot
+from typing import List, Optional
+
+from src.models.base_model import BaseRegressionModel
 
 
 class ConvBlock(nn.Module):
@@ -43,57 +40,87 @@ class ConvBlock(nn.Module):
         return self.block(x)
 
 
-class CNet(L.LightningModule):
+class ABSResiduals(nn.Module):
     """
-    CNet - Convolutional Neural Network for FUCCI intensity regression based on cell images.
+    Absolute residuals.
+    """
+
+    def __init__(self, cyclic: bool = False):
+        super().__init__()
+        self.cyclic = cyclic
+
+    def forward(self, preds: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        """
+        Compute residuals.
+        """
+        if not self.cyclic:
+            return torch.abs(targets - preds)
+        else:
+            # preds should be in [0, 1]
+            circ_pred = preds % 1.0
+            abs_residuals = torch.abs((targets - circ_pred))
+            # geodesic distance i.e. shortest distance on the cyclic curve with length 1
+            geodesic_distance = torch.min(
+                abs_residuals,
+                1.0 - abs_residuals,
+            )
+            return geodesic_distance
+
+    def __repr__(self):
+        return f"ABSResiduals(cyclic={self.cyclic})"
+
+
+class CNet(BaseRegressionModel):
+    """
+    CNet - Convolutional Neural Network for FUCCI intensity regression.
+
+    Inherits training/validation/test logic from BaseRegressionModel.
 
     Args:
         in_channels: Number of input channels
-        output_dim: Dimension of output (e.g., 2 for 2D regression)
+        feature_dim: Dimension of additional features (0 if none)
+        output_dim: Dimension of output (FUCCI intensities 2 and phase curve 1)
         base_filters: Number of filters in first conv layer (doubles each block)
         num_blocks: Number of convolutional blocks
-        fc_hidden_dims: List of hidden layer dimensions for FC layers
-        dropout: Dropout rate
-        learning_rate: Initial learning rate
-        optimizer: Optimizer type ('adam', 'adamw', 'sgd')
-        scheduler: Learning rate scheduler ('plateau', 'cosine', 'step', None)
+        fc_hidden_dims: List[int] = [512, 256],
+        dropout: float = 0.3,
+        use_batchnorm: bool = True,
+        learning_rate: float = 1e-3,
+        optimizer: str = "adam",
+        scheduler: Optional[str] = "plateau",
+        weight_decay: float = 1e-4,
     """
 
     def __init__(
         self,
         in_channels: int = 6,
         feature_dim: int = 0,
-        output_dim: int = 2,  # For 2D regression (e.g., x, y coordinates)
+        output_dim: int = 2,
         base_filters: int = 32,
         num_blocks: int = 4,
         fc_hidden_dims: List[int] = [512, 256],
         dropout: float = 0.3,
+        use_batchnorm: bool = True,
+        # Training parameters (passed to BaseRegressionModel)
         learning_rate: float = 1e-3,
         optimizer: str = "adam",
         scheduler: Optional[str] = "plateau",
         weight_decay: float = 1e-4,
-        use_batchnorm: bool = True,
     ):
-        super().__init__()
+        # Initialize base class with training parameters
+        super().__init__(
+            learning_rate=learning_rate,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            weight_decay=weight_decay,
+        )
 
-        # Save hyperparameters
+        # Save all hyperparameters
         self.save_hyperparameters()
 
         self.in_channels = in_channels
+        self.feature_dim = feature_dim
         self.output_dim = output_dim
-        self.learning_rate = learning_rate
-        self.optimizer_name = optimizer
-        self.scheduler_name = scheduler
-        self.weight_decay = weight_decay
-
-        self.train_residuals = []
-        self.train_predictions = []
-        self.train_targets = []
-        self.val_residuals = []
-        self.val_predictions = []
-        self.val_targets = []
-        self.val_r2_score = R2Score()
-        self.test_r2_score = R2Score()
 
         # Build convolutional blocks
         self.conv_blocks = nn.ModuleList()
@@ -136,21 +163,28 @@ class CNet(L.LightningModule):
         fc_layers.append(nn.Linear(fc_input_dim, output_dim))
         self.fc = nn.Sequential(*fc_layers)
 
-        self.criterion = nn.MSELoss()
+        # Create criterion for this model if dim 1 we predict the position on a cyclic curve
+        self.criterion = ABSResiduals(cyclic=(output_dim == 1))
 
-    def forward(self, image_x, feature_x=None) -> torch.Tensor:
+    def get_criterion(self) -> nn.Module:
+        """Return the loss function for this model"""
+        return self.criterion
+
+    def model_forward(
+        self, image_x: torch.Tensor, feature_x: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         """
         Forward pass
 
         Args:
-            x: Input tensor of shape (batch_size, in_channels, height, width)
+            image_x: Input image tensor of shape (batch_size, in_channels, H, W)
+            feature_x: Optional additional features tensor of shape (batch_size, feature_dim)
 
         Returns:
             For regression: predictions of shape (batch_size, output_dim)
-            For classification: logits of shape (batch_size, output_dim)
         """
 
-        # Ensure input is float32 for compatibility with mixed precision training
+        # Ensure input is float32
         if image_x.dtype != torch.float32:
             image_x = image_x.float()
         if feature_x is not None and feature_x.dtype != torch.float32:
@@ -164,7 +198,7 @@ class CNet(L.LightningModule):
         conv_x = self.global_pool(image_x)
         conv_x = conv_x.view(conv_x.size(0), -1)
 
-        # Concatenate tensors if needed
+        # Concatenate tensors if features are provided
         if feature_x is not None:
             tensor1 = conv_x
             tensor2 = feature_x.view(feature_x.size(0), -1)
@@ -174,166 +208,3 @@ class CNet(L.LightningModule):
         x = self.fc(x)
 
         return x
-
-    def on_validation_epoch_end(self):
-        """Called at the end of validation epoch"""
-        val_r2 = self.val_r2_score.compute()
-        if not self.trainer.sanity_checking:
-            self.logger.experiment.log({"val_r2": val_r2})
-        print(f"Validation Epoch End: R2={val_r2}")
-        self.val_r2_score.reset()
-        super().on_validation_epoch_end()
-        return val_r2
-
-    def _normalize_shapes(
-        self, preds: torch.Tensor, y: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Ensure prediction and target shapes are compatible.
-
-        - Cast to float
-        - If 1D, make (B,1) to match (B,1) convention for output_dim=1
-        """
-        y = y.float()
-        preds = preds.float()
-        if y.dim() == 1:
-            y = y.view(-1, 1)
-        if preds.dim() == 1:
-            preds = preds.view(-1, 1)
-        return preds, y
-
-    def _unpack_inputs(self, x):
-        if isinstance(x, (list, tuple)) and len(x) == 2:
-            return x[0], x[1]
-        return x, None
-
-    def _step(self, batch, stage: str, batch_idx: int):
-        """Shared step for training, validation, and testing"""
-        x, y = batch
-        image_x, feature_x = self._unpack_inputs(x)
-        preds = self(image_x, feature_x)
-
-        preds, y = self._normalize_shapes(preds, y)
-        if preds.shape[1] == 1:
-            abs_phase_loss = torch.min(
-                torch.abs(y - preds) % (2 * torch.pi),
-                (2 * torch.pi - (torch.abs(y - preds) % (2 * torch.pi))),
-            )
-            loss = (abs_phase_loss**2).mean()
-            mae = abs_phase_loss.mean()
-            mse = (abs_phase_loss**2).mean()
-            y_hat = ((preds + torch.pi) % (2 * torch.pi)) - torch.pi
-            y_hat = torch.where(y_hat - y > np.pi, y_hat - 2 * np.pi, y_hat)
-            y_hat = torch.where(y - y_hat > np.pi, y_hat + 2 * np.pi, y_hat)
-        else:
-            loss = self.criterion(preds, y)
-            mae = F.l1_loss(preds, y)
-            mse = F.mse_loss(preds, y)
-            y_hat = preds
-
-        # Logging
-        self.log(
-            f"{stage}_loss",
-            loss,
-            prog_bar=(stage == "train"),
-            on_step=(stage == "train"),
-            on_epoch=True,
-        )
-        self.log(f"{stage}_mae", mae, prog_bar=False, on_step=False, on_epoch=True)
-        self.log(f"{stage}_mse", mse, prog_bar=False, on_step=False, on_epoch=True)
-
-        if stage == "train":
-            self.train_predictions.append(y_hat.detach().cpu().numpy())
-            self.train_targets.append(y.detach().cpu().numpy())
-        elif stage == "val":
-            if batch_idx == 0:
-                self.val_r2_score.reset()
-            self.val_r2_score.update(y_hat, y)
-            self.val_predictions.append(y_hat.detach().cpu().numpy())
-            self.val_targets.append(y.detach().cpu().numpy())
-            print(
-                f"Validation Step Batch {batch_idx}: Loss={loss.item()}, MAE={mae.item()}, MSE={mse.item()}"
-            )
-        elif stage == "test":
-            if batch_idx == 0:
-                self.test_r2_score.reset()
-            self.test_r2_score.update(y_hat, y)
-        return loss
-
-    def training_step(self, batch, batch_idx):
-        return self._step(batch, "train", batch_idx)
-
-    def validation_step(self, batch, batch_idx):
-        return self._step(batch, "val", batch_idx)
-
-    def test_step(self, batch, batch_idx):
-        return self._step(batch, "test", batch_idx)
-
-    def predict_step(self, batch, batch_idx):
-        """Prediction step"""
-        if isinstance(batch, (list, tuple)):
-            x = batch[0]
-        else:
-            x = batch
-        image_x, feature_x = self._unpack_inputs(x)
-        predictions = self(image_x, feature_x)
-        return {"predictions": predictions}
-
-    def on_test_end(self):
-        """Called at the end of test epoch"""
-        test_r2 = self.test_r2_score.compute()
-        if not self.trainer.sanity_checking:
-            self.logger.experiment.log({"test_r2": test_r2})
-        print(f"Test Epoch End: R2={test_r2}")
-        self.test_r2_score.reset()
-        super().on_test_epoch_end()
-        return test_r2
-
-    def configure_optimizers(self):
-        """Configure optimizer and learning rate scheduler"""
-
-        # Select optimizer
-        if self.optimizer_name.lower() == "adam":
-            optimizer = Adam(
-                self.parameters(),
-                lr=self.learning_rate,
-            )
-        elif self.optimizer_name.lower() == "adamw":
-            optimizer = AdamW(
-                self.parameters(), lr=self.learning_rate, weight_decay=self.weight_decay
-            )
-        elif self.optimizer_name.lower() == "sgd":
-            optimizer = SGD(
-                self.parameters(),
-                lr=self.learning_rate,
-                momentum=0.9,
-                weight_decay=self.weight_decay,
-            )
-        else:
-            raise ValueError(f"Unknown optimizer: {self.optimizer_name}")
-
-        # Select scheduler
-        if self.scheduler_name is None:
-            return optimizer
-        if self.scheduler_name.lower() == "plateau":
-            scheduler = ReduceLROnPlateau(optimizer, min_lr=1e-6, patience=3, factor=0.7)
-            return {
-                "optimizer": optimizer,
-                "lr_scheduler": {
-                    "scheduler": scheduler,
-                    "monitor": "val_loss",
-                },
-            }
-        elif self.scheduler_name.lower() == "cosine":
-            scheduler = CosineAnnealingLR(optimizer, T_max=100, eta_min=1e-6)
-            return [optimizer], [scheduler]
-        elif self.scheduler_name.lower() == "step":
-            scheduler = StepLR(optimizer, step_size=10, gamma=0.5)
-            return [optimizer], [scheduler]
-        else:
-            raise ValueError(f"Unknown scheduler: {self.scheduler_name}")
-
-    def on_train_epoch_end(self):
-        """Called at the end of training epoch"""
-        # Log learning rate
-        current_lr = self.trainer.optimizers[0].param_groups[0]["lr"]
-        self.log("learning_rate", current_lr, prog_bar=False)
