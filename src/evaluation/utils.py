@@ -1,12 +1,14 @@
 from pathlib import Path
-from typing import Optional, Callable
+from typing import Optional, Callable, Tuple
 import torch
 import numpy as np
 from typing import Dict
 from torch import nn
 
+
 from src.models.cnet import CNet
 from src.data_pipeline.dataset import ModularCellDataModule
+from src.data_pipeline.curve_projector import FucciCurveProjector
 
 
 def get_device(device: Optional[str] = None) -> torch.device:
@@ -58,6 +60,7 @@ def _get_dataloader(
     dm = ModularCellDataModule(data_config_path=None, data_config=data_config)
     dm.prepare_data()
     dm.setup()
+
     if split == "train":
         return dm.train_dataloader()
     if split == "test":
@@ -90,74 +93,31 @@ def maybe_build_dataloader_from_ckpt(
     return _get_dataloader(data_config=data_cfg, split=split)
 
 
-def circular_distance(angles1: np.ndarray, angles2: np.ndarray) -> np.ndarray:
+def load_ckpt_artifacts(
+    ckpt_path: str, split: str = "val", device: Optional[str] = None
+) -> Tuple[nn.Module, torch.utils.data.DataLoader, FucciCurveProjector]:
     """
-    Compute the shortest angular distance between two sets of angles.
+    Load data and model config artifacts from checkpoint if available.
 
     Args:
-        angles1: First set of angles in radians
-        angles2: Second set of angles in radians
-
-    Returns:
-        Angular distances in radians, always in [0, π]
+        ckpt_path: Path to model checkpoint
     """
-    diff = np.abs(angles1 - angles2)
-    return np.minimum(diff, 2 * np.pi - diff)
 
+    print(f"Loading checkpoint from: {ckpt_path}")
 
-def circular_mae(y_true: np.ndarray, y_pred: np.ndarray) -> float:
-    """Mean Absolute Error for circular data (phases)."""
-    return float(np.mean(circular_distance(y_true, y_pred)))
+    # Load model
+    model = load_model_from_checkpoint(ckpt_path)
+    model.eval().to(device)
 
+    loader = maybe_build_dataloader_from_ckpt(ckpt_path, split)
+    if loader is None:
+        print("Failed to create dataloader from checkpoint.")
+        return
+    dataset = loader.dataset.dataset
+    if dataset.projector is not None:
+        projector = dataset.projector
+    else:
+        projector = FucciCurveProjector(dataset=dataset)
+        projector.fit_from_dataset(use_cache=True)
 
-def circular_mse(y_true: np.ndarray, y_pred: np.ndarray) -> float:
-    """Mean Squared Error for circular data (phases)."""
-    return float(np.mean(circular_distance(y_true, y_pred) ** 2))
-
-
-def circular_r2(y_true: np.ndarray, y_pred: np.ndarray) -> float:
-    """R² score for circular data using circular distance."""
-    ss_res = np.sum(circular_distance(y_true, y_pred) ** 2)
-    # For circular data, compare to mean direction
-    mean_direction = np.mean(y_true)
-    ss_tot = np.sum(circular_distance(y_true, mean_direction) ** 2)
-    return float(1 - (ss_res / ss_tot)) if ss_tot > 0 else 0.0
-
-
-def evaluate_regression_cyclic(
-    y_true: np.ndarray, y_pred: np.ndarray, prefix: str = "test", is_phase: bool = True
-) -> Dict[str, float]:
-    """
-    Evaluate regression with support for cyclic (phase) data.
-
-    Args:
-        y_true: Ground truth values [N,] for phase or [N, 2] for intensities
-        y_pred: Predicted values [N,] for phase or [N, 2] for intensities
-        prefix: Metric name prefix
-        is_phase: Whether data is phase (cyclic) or not
-
-    Returns:
-        Dictionary of metrics
-    """
-    from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
-
-    metrics = {}
-
-    # Flatten if needed
-    y_true_flat = y_true.flatten() if y_true.ndim > 1 and y_true.shape[1] == 1 else y_true
-    y_pred_flat = y_pred.flatten() if y_pred.ndim > 1 and y_pred.shape[1] == 1 else y_pred
-
-    # Standard metrics
-    metrics[f"{prefix}_mse"] = mean_squared_error(y_true_flat, y_pred_flat)
-    metrics[f"{prefix}_mae"] = mean_absolute_error(y_true_flat, y_pred_flat)
-    metrics[f"{prefix}_r2"] = r2_score(y_true_flat, y_pred_flat)
-    metrics[f"{prefix}_rmse"] = np.sqrt(metrics[f"{prefix}_mse"])
-
-    # Cyclic metrics for phase data
-    if is_phase and y_true_flat.ndim == 1:
-        metrics[f"{prefix}_circular_mae"] = circular_mae(y_true_flat, y_pred_flat)
-        metrics[f"{prefix}_circular_mse"] = circular_mse(y_true_flat, y_pred_flat)
-        metrics[f"{prefix}_circular_r2"] = circular_r2(y_true_flat, y_pred_flat)
-        metrics[f"{prefix}_circular_rmse"] = np.sqrt(metrics[f"{prefix}_circular_mse"])
-
-    return metrics
+    return model, loader, projector
