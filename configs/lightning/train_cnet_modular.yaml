@@ -5,8 +5,7 @@
 seed_everything: 42
 
 project_name: cnet_cell_cycle
-experiment_name: cnet_experiment_middle_plane_augmented
-
+experiment_name: cnet_experiment_polygon_projection
 # Trainer configuration
 trainer:
   default_root_dir: checkpoints/cnet/
@@ -14,14 +13,14 @@ trainer:
   accelerator: auto
   devices: 1
   #gradient_clip_val: 1.0
-  #overfit_batches: 0.018
+  # overfit_batches: 0.018
   log_every_n_steps: 10
   enable_checkpointing: true
   profiler: simple
   callbacks:
     - class_path: src.train.callbacks.DebugCallback
       init_args: {}
-    - class_path: src.train.callbacks.PlotCallback
+    - class_path: src.train.callbacks.EvaluationCallback
       init_args: {}
     - class_path: lightning.pytorch.callbacks.ModelSummary
       init_args:
@@ -48,7 +47,7 @@ model:
   init_args:
     in_channels: 2  # 2 channels × 3 planes = 6 total channels after stacking
     #feature_dim: 19
-    output_dim: 2
+    output_dim: 1
     num_blocks: 5
     dropout: 0.3
     use_batchnorm: true

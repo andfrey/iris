@@ -3,65 +3,63 @@ model:
 
   # Default XGBoost hyperparameters (used for single fit runs)
   # Learning rate (eta)
-  learning_rate: 0.035376
+  learning_rate: 0.006516260192419732
 
   # Maximum tree depth
-  max_depth: 3
+  max_depth: 7
 
   # Number of boosting rounds
-  n_estimators: 300
+  n_estimators: 400
 
   # Subsample ratio of training instances
-  subsample: 0.89234
+  subsample: 0.5004365784721089
 
   # Subsample ratio of columns when constructing each tree
-  colsample_bytree: 0.70208
+  colsample_bytree: 0.8568098315721893
 
   # Minimum sum of instance weight needed in a child
-  min_child_weight: 1
+  min_child_weight: 7
 
   # L2 regularization term on weights
-  reg_lambda: 3.5
+  reg_lambda: 0.003352439134845121
 
   # L1 regularization term on weights
-  reg_alpha: 0.0
+  reg_alpha: 0.017381468327804864
 
   # Minimum loss reduction required to make a further partition
-  gamma: 0.0041141
+  gamma: 4.923244830583994
 
   # Random seed
   random_state: 42
 
 data:
   # Data source
-  h5_path: /myhome/iris/data/fucci_3t3_221124_filtered_noNG030JP208_with_nuclei_seg.h5
-
+  data_source:
+    h5_path: /myhome/iris/data/fucci_3t3_221124_filtered_noNG030JP208_with_nuclei_seg.h5
+    quality_filters:
+      plane_count: 3
+      max_objects: 1
+      min_seg_pixels: 10
+      max_nuclei_outside_ratio: 0.2
+      force_refilter: false  # Use cached results if available
   # DataLoader settings
   batch_size: 64
   num_workers: 0  # Use 0 for A100 to avoid shared memory issues
 
   # Train/test split ratio
-  train: 0.9  # Train, Val, Test splits
   data_split: [0.7, 0.2, 0.1]
   seed: 42
 
-  # Quality filters
-  use_quality_filters: true
-  plane_count: 3
-  max_objects: 1
-  min_seg_pixels: 10
-  max_nuclei_outside_ratio: 0.2
-  force_refilter: false  # Use cached results if available
 
   fucci_transform:
     log: {}
 
-  image_transform_config:
+  image_transforms:
   - class_path: src.data_pipeline.data_transforms.SelectPlanesTransform
     init_args:
       plane_selection: 'middle'
-  feature_transform_config:
+  feature_transforms:
    - class_path: sklearn.preprocessing.StandardScaler
      init_args: {}
 
-  fucci_project_to_curve: true
+  fucci_1D_projection: false

@@ -1,5 +1,5 @@
 project: cell_cycle_ridge_sweep
-count: 20
+count: 50
 method: bayes  # Options: grid, random, bayes
 metric:
   name: val_mse
@@ -8,6 +8,5 @@ metric:
 parameters:
   # Regularization strength
   alpha:
-    distribution: log_uniform_values
     min: 0.0001
     max: 10.0
