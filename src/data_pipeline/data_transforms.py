@@ -4,6 +4,7 @@ Composable transforms that can be chained together.
 """
 
 from abc import ABC, abstractmethod
+import importlib
 from typing import Dict, Any, List, Optional
 import cv2
 import numpy as np
@@ -387,24 +388,6 @@ class NormalizeTransform(ChannelTransform):
         }
 
 
-class GaussianFilterTransform(ChannelTransform):
-    """Apply Gaussian smoothing filter"""
-
-    def __init__(self, channel_keys: Optional[List[str]] = None, sigma: float = 1.0):
-        super().__init__(channel_keys)
-        self.sigma = sigma
-
-    def transform_image(self, image: np.ndarray, channel_key: str) -> np.ndarray:
-        return ndimage.gaussian_filter(image, sigma=self.sigma)
-
-    def get_config(self) -> Dict[str, Any]:
-        return {
-            "type": "GaussianFilterTransform",
-            "channel_keys": self.channel_keys,
-            "sigma": self.sigma,
-        }
-
-
 class SelectPlanesTransform(Transform):
     """Select specific planes from multi-plane channels"""
 
@@ -466,43 +449,6 @@ class SelectPlanesTransform(Transform):
         }
 
 
-class RollingBallTransform(ChannelTransform):
-    """Apply rolling ball background subtraction"""
-
-    def __init__(
-        self,
-        channel_keys: Optional[List[str]] = None,
-        radius: int = 50,
-        light_background: bool = False,
-    ):
-        """
-        Args:
-            channel_keys: Which channels to apply the transform to
-            radius: Radius of the rolling ball (larger = smoother background)
-            light_background: True if background is lighter than foreground
-        """
-        super().__init__(channel_keys)
-        self.radius = radius
-
-    def transform_image(self, image: np.ndarray, channel_key: str) -> np.ndarray:
-        # Estimate background
-        background = rolling_ball(image, radius=self.radius)
-
-        image = image - background
-
-        # Clip negative values
-        image = np.clip(image, 0, None)
-
-        return image
-
-    def get_config(self) -> Dict[str, Any]:
-        return {
-            "type": "RollingBallTransform",
-            "channel_keys": self.channel_keys,
-            "radius": self.radius,
-        }
-
-
 class TransformPipeline(Transform):
     """Compose multiple transforms into a pipeline"""
 
@@ -526,3 +472,32 @@ class TransformPipeline(Transform):
 
     def __len__(self):
         return len(self.transforms)
+
+
+def create_transform_pipeline_from_config(transforms: List, transform_type: str = "image"):
+    # Local import to avoid circular import
+
+    if transform_type not in ["image", "feature"]:
+        raise ValueError(f"Invalid transform pipeline type: {transform_type}")
+    print(f"\nCreating {transform_type} transform pipeline")
+    print(f"   - Using {transforms} transforms")
+
+    resolved_transforms = [
+        resolve(cfg["class_path"])(**cfg.get("init_args", {})) for cfg in transforms
+    ]
+    if transform_type == "image":
+        transform_pipeline = TransformPipeline(resolved_transforms)
+    else:
+        from sklearn.pipeline import Pipeline
+
+        transform_pipeline = Pipeline(
+            steps=[(repr(transform), transform) for transform in transforms]
+        )
+
+    return transform_pipeline
+
+
+def resolve(name: str):
+    module_name, attr_name = name.rsplit(".", 1)
+    module = importlib.import_module(module_name)
+    return getattr(module, attr_name)

@@ -2,59 +2,103 @@
 Modern PyTorch Dataset implementation using the new modular architecture.
 """
 
+from dataclasses import dataclass, field
+import yaml
+from typing import Optional, List, Dict, Any, Tuple, Union
+from copy import deepcopy
+import traceback
+
 import torch
 from torch.utils.data import Dataset, DataLoader, random_split
 from torchvision.transforms import v2
-from typing import Optional, List, Dict, Any, Tuple
 from pathlib import Path
 import numpy as np
 import lightning as L
 from tqdm import tqdm
-import yaml
+import pandas as pd
+
+
 from .utils import (
     save_parquet_cache,
     load_parquet_cache,
     make_hash_from_dict,
-    create_data_source_from_config,
-    create_transform_pipeline_from_config,
 )
-import pandas as pd
-
-
-from .data_sources import DataSource, CellData
-from .data_transforms import Transform
+from .data_sources import DataSource, CellData, DataSourceConfig, create_data_source_from_config
+from .data_transforms import Transform, create_transform_pipeline_from_config
 from .feature_extractor import FeatureExtractor
 from .curve_projector import FucciCurveProjector
-import traceback
-from copy import deepcopy
+
+
+@dataclass
+class DataModuleConfig:
+    batch_size: int = 64
+    num_workers: int = 16
+    data_split: List[float] = field(default_factory=lambda: [0.7, 0.2, 0.1])
+    seed: int = 42
+
+
+@dataclass
+class DataSetConfig(DataModuleConfig):
+    data_source: Optional[DataSourceConfig] = None
+    image_transforms: List[Dict[str, Any]] = field(default_factory=list)
+    feature_transforms: List[Dict[str, Any]] = field(default_factory=list)
+    augmentations: Optional[Dict[str, Any]] = None
+    input_channels: List[str] = field(default_factory=lambda: ["bf", "405"])
+    add_features: bool = False
+    mask_intensity: str = "segmentation"
+    fucci_transform: Dict[str, Any] = field(default_factory=dict)
+    fucci_1D_projection: bool = False
+    projection_shape: Optional[str] = None
+
+    def __post_init__(self):
+        """Convert dict to DataSourceConfig if needed."""
+        if isinstance(self.data_source, dict):
+            self.data_source = DataSourceConfig(**self.data_source)
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert DataSetConfig to dictionary for legacy compatibility."""
+        from dataclasses import asdict
+
+        return asdict(self)
 
 
 # === BaseCellDataset ===
 class BaseCellDataset(Dataset):
     def __init__(
         self,
-        data_config: DataSource,
+        data_config: DataSetConfig,
     ):
-        self.config = data_config
+        if isinstance(data_config, dict):
+            self.config = DataSetConfig(**data_config)
+        else:
+            self.config = data_config
+
         self.image_transform = create_transform_pipeline_from_config(
-            self.config, transform_type="image"
+            self.config.image_transforms, transform_type="image"
         )
-        self.mask_intensity = self.config.get("mask_intensity", "segmentation")
+        self.mask_intensity = self.config.mask_intensity
+
         # Create data source
-        self.data_source = create_data_source_from_config(self.config)
-        self.fucci_transform = self.config.get("fucci_transform", {})
-        if "scale" in self.fucci_transform:
-            self.scale_divider_488 = self.fucci_transform.get("scale_divider_488", 1.0)
-            self.scale_divider_561 = self.fucci_transform.get("scale_divider_561", 1.0)
+        self.data_source = create_data_source_from_config(self.config.data_source)
+
+        # Handle FUCCI transforms
+        if "scale" in self.config.fucci_transform:
+            self.scale_divider_488 = self.config.fucci_transform.get("scale_divider_488", 1.0)
+            self.scale_divider_561 = self.config.fucci_transform.get("scale_divider_561", 1.0)
             self.fucci_scaler = np.array([self.scale_divider_488, self.scale_divider_561])
             print(f"✓ Scale dividers: 488={self.scale_divider_488}, 561={self.scale_divider_561}")
 
         self.cell_ids = self.data_source.get_cell_ids()
-        self.project_to_curve = data_config.get("fucci_project_to_curve", False)
+        self.fucci_1D_projection = self.config.fucci_1D_projection
         self.projector = None
-        if self.project_to_curve:
-            self.projector = FucciCurveProjector(dataset=deepcopy(self))
+
+        if self.fucci_1D_projection:
+            self.projector = FucciCurveProjector(
+                dataset=deepcopy(self), shape=self.config.projection_shape
+            )
             self.projector.fit_from_dataset(use_cache=True)
+            print("✓ FUCCI 1D projection enabled")
+
         print(f"✓ Dataset initialized with {len(self.cell_ids):,} cells")
 
     def __len__(self) -> int:
@@ -64,7 +108,7 @@ class BaseCellDataset(Dataset):
         cell_id = self.cell_ids[idx]
         cell_data = self.data_source.load_cell(cell_id)
         labels = self.compute_labels(cell_data)
-        if self.project_to_curve and self.projector is not None:
+        if self.fucci_1D_projection and self.projector is not None:
             labels = self.projector.project(labels)[0]
             labels = np.array([labels]) if isinstance(labels, float) else np.array(labels)
         if self.image_transform:
@@ -73,110 +117,59 @@ class BaseCellDataset(Dataset):
 
     def compute_labels(self, cell_data):
         labels = compute_fucci_labels(cell_data, mask_intensity=self.mask_intensity)
-        if "scale" in self.fucci_transform:
+
+        if "scale" in self.config.fucci_transform:
             labels = labels / self.fucci_scaler
-        elif "log" in self.fucci_transform:
+        elif "log" in self.config.fucci_transform:
             # to avoid log(0) and log of negative values
             if labels[0] <= 1e-6:
                 labels[0] = 1e-6
             if labels[1] <= 1e-6:
                 labels[1] = 1e-6
             labels = np.log(labels)
+
         return labels
+
+    def get_projector(self) -> FucciCurveProjector:
+        return self.projector
 
 
 class ModularCellDataModule(L.LightningDataModule):
     """
     Lightning DataModule for the cell dataset.
-
-    Using the ModularCellDataset assembling configurable DataSource, filters, and transforms into
-    a Pytorch Dataset subclass.
-    Which is used to create dataloaders for training, validation, testing, and prediction.
-
-    Example config:
-        data:
-          h5_path: data/file.h5
-          batch_size: 64
-          num_workers: 0
-          train_val_split: [0.8, 0.2]
-          filters:
-            plane_count: 3
-            max_objects: 1
-            min_seg_pixels: 10
-            max_nuclei_ratio: 1.2
-          transforms:
-            - class_path: src.data_pipeline.data_transforms.NormalizeTransform
-            - init_args:
-                method: standardize  # Changed to standardize for zero mean and unit variance
-                channel_keys: ['405', 'bf']
     """
 
     def __init__(
         self,
-        data_config_path: str,
-        data_config: Optional[Dict[str, Any]] = None,
+        data_config_path: Optional[str] = None,
+        data_config: Optional[DataSetConfig] = None,
     ):
         """
         Args:
-            data_config_path: Path to YAML config file with data parameters
-                            h5_path: Path to H5 file
-                            batch_size: Batch size for dataloaders
-                            num_workers: Number of workers for dataloaders
-                            train_val_split: Train/validation split ratios [train, val]
-
-                            Filter parameters:
-                            use_quality_filters: Whether to apply quality filters
-                            plane_count: Expected number of planes per channel
-                            max_objects: Maximum objects in segmentation mask
-                            min_seg_pixels: Minimum pixels in segmentation mask
-                            max_nuclei_ratio: Maximum nuclei/cell area ratio
-                            force_refilter: Force re-filtering even if cache exists
-
-                            Transform parameters (ordered list of transforms):
-                            transforms:
-                            - class_path: src.data_pipeline.data_transforms.NormalizeTransform
-                            init_args:
-                                method: standardize  # Changed to standardize for zero mean and unit variance
-                                channel_keys: ['405', 'bf']
+            data_config_path: Path to YAML config file
+            data_config: DataSetConfig object (alternative to yaml path)
         """
         super().__init__()
+
         if data_config is None:
+            if data_config_path is None:
+                raise ValueError("Either data_config_path or data_config must be provided")
             with open(data_config_path, "r") as f:
-                self.config = yaml.safe_load(f)
-            # Save hyperparameters for Lightning
-            self.save_hyperparameters(self.config)
+                config_dict = yaml.safe_load(f)
+            self.config = DataSetConfig(**config_dict)
+        elif isinstance(data_config, dict):
+            self.config = DataSetConfig(**data_config)
         else:
             self.config = data_config
 
-        # Store parameters
-        self.h5_path = self.config.get("h5_path", None)
-        # Resolve relative path
-        if not Path(self.h5_path).exists():
-            abs_path = Path(__file__).resolve().parent.parent / self.h5_path
-            if Path(abs_path).exists():
-                self.config["h5_path"] = abs_path
-            else:
-                raise FileNotFoundError(f"H5 file not found: {self.h5_path}")
-
-        self.batch_size = self.config.get("batch_size", 64)
-        self.num_workers = self.config.get("num_workers", 0)
-        self.data_split = self.config.get("data_split", [0.7, 0.2, 0.1])
-        self.seed = self.config.get("seed", 42)  # For reproducibility
+        # Save hyperparameters for Lightning
+        self.save_hyperparameters(self.config.to_dict())
 
         # Datasets (initialized in setup)
         self.train_dataset = None
         self.val_dataset = None
+        self.test_dataset = None
         self.full_dataset = None
-
-    def prepare_data(self):
-        """Check if data exists"""
-        if self.h5_path is None:
-            raise ValueError("h5_path must be specified in data config")
-        h5_path = Path(self.h5_path)
-        if not h5_path.exists():
-            raise FileNotFoundError(f"H5 file not found: {self.h5_path}")
-
-        print(f"✓ H5 file found: {self.h5_path}")
 
     def setup(self, stage: Optional[str] = None):
         """
@@ -193,18 +186,14 @@ class ModularCellDataModule(L.LightningDataModule):
         print("Setting up ModularCellDataModule")
         print("=" * 60)
 
-        if self.config.get("add_features", False):
-            self.full_dataset = ModularCellImageFeatureDataset(
-                self.config,
-            )
+        if self.config.add_features:
+            self.full_dataset = ModularCellImageFeatureDataset(self.config)
         else:
-            self.full_dataset = ModularCellImageDataset(
-                self.config,
-            )
+            self.full_dataset = ModularCellImageDataset(self.config)
 
         # Split with generator for reproducibility
         self.train_dataset, self.val_dataset, self.test_dataset = split_dataset(
-            self.full_dataset, self.data_split, self.seed
+            self.full_dataset, self.config.data_split, self.config.seed
         )
         self.train_dataset = torch.utils.data.Subset(
             deepcopy(self.full_dataset), self.train_dataset.indices
@@ -221,7 +210,6 @@ class ModularCellDataModule(L.LightningDataModule):
         print(f"   ✓ Test:  {len(self.test_dataset):,} samples")
 
         # Enable augmentation only on training dataset (if available in the dataset)
-
         self.train_dataset.dataset.apply_augmentation = True
         self.val_dataset.dataset.apply_augmentation = False
         self.test_dataset.dataset.apply_augmentation = False
@@ -236,40 +224,40 @@ class ModularCellDataModule(L.LightningDataModule):
         """Returns training dataloader."""
         return DataLoader(
             self.train_dataset,
-            batch_size=self.batch_size,
+            batch_size=self.config.batch_size,
             shuffle=True,
-            num_workers=self.num_workers,
-            pin_memory=True if self.num_workers > 0 else False,
+            num_workers=self.config.num_workers,
+            pin_memory=True if self.config.num_workers > 0 else False,
         )
 
     def val_dataloader(self) -> DataLoader:
         """Returns validation dataloader."""
         return DataLoader(
             self.val_dataset,
-            batch_size=self.batch_size,
+            batch_size=self.config.batch_size,
             shuffle=False,
-            num_workers=self.num_workers,
-            pin_memory=True if self.num_workers > 0 else False,
+            num_workers=self.config.num_workers,
+            pin_memory=True if self.config.num_workers > 0 else False,
         )
 
     def test_dataloader(self) -> DataLoader:
-        """Returns test dataloader (uses val dataset for now)."""
+        """Returns test dataloader."""
         return DataLoader(
             self.test_dataset,
-            batch_size=self.batch_size,
+            batch_size=self.config.batch_size,
             shuffle=False,
-            num_workers=self.num_workers,
-            pin_memory=True if self.num_workers > 0 else False,
+            num_workers=self.config.num_workers,
+            pin_memory=True if self.config.num_workers > 0 else False,
         )
 
     def predict_dataloader(self) -> DataLoader:
         """Returns prediction dataloader (full dataset)."""
         return DataLoader(
             self.full_dataset,
-            batch_size=self.batch_size,
+            batch_size=self.config.batch_size,
             shuffle=False,
-            num_workers=self.num_workers,
-            pin_memory=True if self.num_workers > 0 else False,
+            num_workers=self.config.num_workers,
+            pin_memory=True if self.config.num_workers > 0 else False,
         )
 
 
@@ -278,8 +266,11 @@ class ModularCellImageDataset(BaseCellDataset):
     Generic cell image dataset that works with any DataSource and Transform pipeline.
     """
 
-    def __init__(self, data_config):
-        self.input_channels = data_config.get("input_channels", ["bf", "405"])
+    def __init__(self, data_config: DataSetConfig):
+        if isinstance(data_config, dict):
+            data_config = DataSetConfig(**data_config)
+
+        self.input_channels = data_config.input_channels
         # Flag toggled by the DataModule to ensure augmentation is applied only on the train split
         self.apply_augmentation = False
         super().__init__(data_config=data_config)
@@ -321,22 +312,8 @@ class ModularCellImageDataset(BaseCellDataset):
         return images_tensor, labels_tensor
 
     def create_augmentation_transform(self):
-        """Create a torchvision.transforms pipeline from self.config.
-
-           augmentations:
-             - name: RandomHorizontalFlip
-               init_args: { p: 0.5 }
-             - name: RandomRotation
-               init_args: 15                      # degrees (can be scalar or [min,max])
-             - name: GaussianBlur
-               init_args: { kernel_size: 3, sigma: [0.5, 1.5] }
-               apply_prob: 0.2                    # optional wrapper via RandomApply
-
-        Returns a callable that accepts a torch.Tensor (C,H,W) and returns the augmented tensor,
-        or None if augmentation is disabled or torchvision is unavailable.
-        """
-
-        aug_dict = self.config.get("augmentations", None)
+        """Create a torchvision.transforms pipeline from self.config."""
+        aug_dict = self.config.augmentations
         if aug_dict is None:
             return None
 
@@ -349,9 +326,6 @@ class ModularCellImageDataset(BaseCellDataset):
             "GaussianBlur": v2.GaussianBlur,
             "RandomErasing": v2.RandomErasing,
             "CenterCrop": v2.CenterCrop,
-            # Add more if needed depending on torchvision version
-            # "RandomPerspective": v2.RandomPerspective,
-            # "RandomResizedCrop": v2.RandomResizedCrop,
         }
 
         transforms_list = []
@@ -369,15 +343,15 @@ class ModularCellImageDataset(BaseCellDataset):
 class ModularCellImageFeatureDataset(ModularCellImageDataset):
     """
     Dataset that returns selected images, transformed features, and fucci labels for each cell.
-    Subclass of ModularCellImageDataset.
     """
 
-    def __init__(self, data_config):
+    def __init__(self, data_config: DataSetConfig):
+        if isinstance(data_config, dict):
+            data_config = DataSetConfig(**data_config)
+
         super().__init__(data_config=data_config)
         self.feature_extractor = FeatureExtractor()
-        self.feature_dataset = ModularCellFeaturesDataset(
-            data_config=data_config,
-        )
+        self.feature_dataset = ModularCellFeaturesDataset(data_config=data_config)
         self.feature_transform = None
         self.fit_feature_transform()
 
@@ -411,24 +385,21 @@ class ModularCellFeaturesDataset(BaseCellDataset):
 
     def __init__(
         self,
-        data_config: dict,
+        data_config: DataSetConfig,
         use_cache: bool = True,
     ):
+        if isinstance(data_config, dict):
+            data_config = DataSetConfig(**data_config)
+
         self.use_cache = use_cache
         self.feature_extractor = FeatureExtractor()
-        super().__init__(
-            data_config=data_config,
-        )
+        super().__init__(data_config=data_config)
+
         self.feature_transform = create_transform_pipeline_from_config(
-            data_config, transform_type="feature"
+            data_config.feature_transforms, transform_type="feature"
         )
 
-        # if self.project_to_curve and self.projector is not None:
-        #     self.label_names = ["cell_cycle_phase"]
-        # else:
-        #     self.label_names = ["label_488", "label_561"]
         self.label_names = ["label_488", "label_561"]
-
         self.df = None
 
     def _get_cache_key(self) -> str:
@@ -441,7 +412,7 @@ class ModularCellFeaturesDataset(BaseCellDataset):
             ),
             "label_names": self.label_names,
         }
-        cache_params.update(self.config.get("fucci_transform", {}))
+        cache_params.update(self.config.fucci_transform)
         cache_hash = make_hash_from_dict(cache_params, length=12)
         return f"features_{cache_hash}"
 
@@ -552,26 +523,13 @@ class ModularCellFeaturesDataset(BaseCellDataset):
         return X, y
 
     def split_set(self) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-        """
-        Split the dataset into training, validation and testing subsets.
-
-        Args:
-            train_ratio: Proportion of data to use for training (default: 0.8)
-            seed: Random seed for reproducibility
-
-        Returns:
-            Tuple of (train_df, val_df, test_df)
-        """
-        # Set random seed for reproducibility
-        seed = self.config.get("seed")
-        data_split = self.config.get("data_split")
-
+        """Split the dataset into training, validation and testing subsets."""
         dataset_df = self.get_dataset_df()
 
         train_dataset, val_dataset, test_dataset = split_dataset(
             dataset=self,
-            data_split=data_split,
-            seed=seed,
+            data_split=self.config.data_split,
+            seed=self.config.seed,
         )
         # Map subset indices back into the DataFrame
         train_df = dataset_df.iloc[train_dataset.indices]

@@ -5,7 +5,7 @@ Each adapter provides a unified interface for reading data.
 
 import json
 from abc import ABC, abstractmethod
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, Union
 from pathlib import Path
 from dataclasses import dataclass, field
 import h5py
@@ -14,7 +14,43 @@ from tqdm import tqdm
 import hashlib
 import os
 
-from .data_filters import CellFilter, CompositeFilter, FilterStatistics, FilterResult
+from .data_filters import (
+    CellFilter,
+    CompositeFilter,
+    FilterStatistics,
+    FilterResult,
+    PlaneCountFilter,
+    EmptySegmentationFilter,
+    MultipleObjectsFilter,
+    CellNucleiOverlappingFilter,
+)
+
+
+@dataclass
+class FilterConfig:
+    """Configuration for quality filters"""
+
+    plane_count: int = 3
+    max_objects: int = 1
+    min_seg_pixels: int = 10
+    max_nuclei_outside_ratio: float = 1.2
+    force_refilter: bool = False
+
+
+@dataclass
+class DataSourceConfig:
+    """Configuration for data source creation"""
+
+    h5_path: str
+    quality_filters: FilterConfig
+
+    def __post_init__(self):
+        # Ensure h5_path is a string
+        self.quality_filers = (
+            FilterConfig(**self.quality_filters)
+            if isinstance(self.quality_filters, dict)
+            else self.quality_filters
+        )
 
 
 @dataclass
@@ -288,9 +324,7 @@ class FilteredDataSource:
                 # Record as invalid due to load error
                 self._filter_stats.record_result(
                     cell_id,
-                    FilterResult(
-                        is_valid=False, reason="load_error", metadata={"error": str(e)}
-                    ),
+                    FilterResult(is_valid=False, reason="load_error", metadata={"error": str(e)}),
                 )
 
         self._valid_cell_ids = self._filter_stats.valid_cell_ids
@@ -327,3 +361,66 @@ class FilteredDataSource:
 
     def __len__(self) -> int:
         return len(self.get_cell_ids())
+
+
+def create_data_source_from_config(config: Dict) -> DataSource:
+    """Create DataSource from data configuration dictionary."""
+
+    h5_path = config.h5_path
+    # Resolve relative path
+    if not Path(h5_path).exists():
+        abs_path = Path(__file__).resolve().parent.parent / h5_path
+        if Path(abs_path).exists():
+            h5_path = abs_path
+        else:
+            raise FileNotFoundError(f"H5 file not found: {h5_path}")
+    qualit_filters_config = config.quality_filters
+    qualit_filters_config = (
+        FilterConfig(**qualit_filters_config)
+        if isinstance(qualit_filters_config, dict)
+        else qualit_filters_config
+    )
+
+    plane_count = qualit_filters_config.plane_count
+    max_objects = qualit_filters_config.max_objects
+    min_seg_pixels = qualit_filters_config.min_seg_pixels
+    max_nuclei_outside_ratio = qualit_filters_config.max_nuclei_outside_ratio
+    force_refilter = qualit_filters_config.force_refilter
+    # 1. Create data source
+    print(f"\nCreating data source from: {h5_path}")
+    data_source = H5DataSource(
+        path=h5_path,
+        plane_selection="all",  # Load all planes, select later in transform
+    )
+    print(f"   ✓ Found {len(data_source.get_cell_ids()):,} total cells")
+
+    # 2. Apply quality filters (optional)
+
+    print(f"\nApplying quality filters:")
+    print(f"   - Plane count: {plane_count}")
+    print(f"   - Max objects: {max_objects}")
+    print(f"   - Min segmentation pixels: {min_seg_pixels}")
+    print(f"   - Max nuclei outside ratio: {max_nuclei_outside_ratio}")
+
+    filters = []
+    filters.extend([PlaneCountFilter(expected_planes=plane_count)] if plane_count else [])
+    filters.extend([EmptySegmentationFilter(min_pixels=min_seg_pixels)] if min_seg_pixels else [])
+    filters.extend([MultipleObjectsFilter(max_objects=max_objects)] if max_objects else [])
+    filters.extend(
+        [CellNucleiOverlappingFilter(max_ratio=max_nuclei_outside_ratio)]
+        if max_nuclei_outside_ratio
+        else []
+    )
+
+    filtered_source = FilteredDataSource(
+        data_source=data_source,
+        filters=filters,
+        cache_results=True,
+        force_refilter=force_refilter,
+    )
+
+    print(f"   ✓ Filtered to {len(filtered_source.get_cell_ids()):,} valid cells")
+
+    data_source = filtered_source
+
+    return data_source

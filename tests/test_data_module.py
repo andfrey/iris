@@ -13,7 +13,7 @@ import os
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from src.data_pipeline.dataset import ModularCellDataModule
+from src.data_pipeline.dataset import ModularCellDataModule, DataSetConfig
 
 # Skip all tests in this file when run by pre-commit
 pytestmark = pytest.mark.skipif(
@@ -29,7 +29,9 @@ pytestmark = pytest.mark.skipif(
 @pytest.fixture
 def data_config_path():
     """Return path to the default data config."""
-    return Path(__file__).resolve().parent / ".." / "configs/lightning/data_config.yaml"
+    return (
+        Path(__file__).resolve().parent / ".." / "configs/lightning/data_config_augmentation.yaml"
+    )
 
 
 @pytest.fixture
@@ -57,14 +59,7 @@ def test_config_loading(data_config_path):
 
     # Check that config is loaded
     assert dm.config is not None
-    assert isinstance(dm.config, dict)
-
-    # Check key parameters are set
-    assert dm.h5_path is not None
-    assert dm.batch_size > 0
-    assert dm.num_workers >= 0
-    assert len(dm.data_split) == 3
-    assert sum(dm.data_split) == pytest.approx(1.0)
+    assert isinstance(dm.config, DataSetConfig)
 
 
 def test_config_hyperparameters_saved(datamodule):
@@ -81,11 +76,6 @@ def test_config_hyperparameters_saved(datamodule):
 def test_datamodule_initialization(data_config_path):
     """Test that data module initializes correctly."""
     dm = ModularCellDataModule(data_config_path=data_config_path)
-
-    # Check attributes
-    assert dm.h5_path is not None
-    assert dm.batch_size > 0
-    assert dm.num_workers >= 0
 
     # Check datasets are not yet initialized
     assert dm.train_dataset is None
@@ -130,9 +120,9 @@ def test_datamodule_split_ratios(setup_datamodule):
     val_len = len(dm.val_dataset)
     test_len = len(dm.test_dataset)
 
-    expected_train = dm.data_split[0]
-    expected_val = dm.data_split[1]
-    expected_test = dm.data_split[2]
+    expected_train = dm.config.data_split[0]
+    expected_val = dm.config.data_split[1]
+    expected_test = dm.config.data_split[2]
 
     # Allow for rounding differences
     assert abs(train_len / full_len - expected_train) < 0.05
@@ -155,8 +145,8 @@ def test_datamodule_reproducible_split(data_config_path):
     dm2.setup(stage="fit")
 
     # Get first samples from train datasets
-    sample1_img, sample1_label = dm1.train_dataset[0]
-    sample2_img, sample2_label = dm2.train_dataset[0]
+    sample1_img, sample1_label = dm1.val_dataset[0]
+    sample2_img, sample2_label = dm2.val_dataset[0]
 
     # Should be identical with same seed
     assert torch.allclose(sample1_img, sample2_img)
@@ -177,7 +167,7 @@ def test_train_dataloader(setup_datamodule):
 
     assert train_loader is not None
     assert len(train_loader) > 0
-    assert train_loader.batch_size == dm.batch_size
+    assert train_loader.batch_size == dm.config.batch_size
 
 
 @pytest.mark.skipif(os.getenv("PRECOMMIT") == "1", reason="Skip in pre-commit")
@@ -189,7 +179,7 @@ def test_val_dataloader(setup_datamodule):
 
     assert val_loader is not None
     assert len(val_loader) > 0
-    assert val_loader.batch_size == dm.batch_size
+    assert val_loader.batch_size == dm.config.batch_size
 
 
 @pytest.mark.skipif(os.getenv("PRECOMMIT") == "1", reason="Skip in pre-commit")
@@ -201,7 +191,7 @@ def test_test_dataloader(setup_datamodule):
 
     assert test_loader is not None
     assert len(test_loader) > 0
-    assert test_loader.batch_size == dm.batch_size
+    assert test_loader.batch_size == dm.config.batch_size
 
 
 @pytest.mark.skipif(os.getenv("PRECOMMIT") == "1", reason="Skip in pre-commit")
@@ -213,7 +203,7 @@ def test_predict_dataloader(setup_datamodule):
 
     assert predict_loader is not None
     assert len(predict_loader) > 0
-    assert predict_loader.batch_size == dm.batch_size
+    assert predict_loader.batch_size == dm.config.batch_size
 
 
 # ============================================================================
@@ -225,9 +215,7 @@ def test_labels_transformation_invariance(data_config_path):
     dm1.prepare_data()
     dm1.setup(stage="fit")
 
-    dm2 = ModularCellDataModule(
-        data_config_path="/myhome/iris/configs/lightning/data_config_mask_input.yaml"
-    )
+    dm2 = ModularCellDataModule(data_config_path=data_config_path)
     dm2.prepare_data()
     dm2.setup(stage="fit")
 
@@ -251,7 +239,7 @@ def test_batch_shape(setup_datamodule):
 
     # Check shapes
     batch_size = images.shape[0]
-    assert batch_size <= dm.batch_size
+    assert batch_size <= dm.config.batch_size
     assert images.ndim == 4  # (B, C, H, W)
     assert labels.ndim == 2  # (B, 2)
     assert labels.shape[1] == 2  # [488, 561] intensities

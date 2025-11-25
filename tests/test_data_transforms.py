@@ -13,7 +13,6 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from src.data_pipeline.data_transforms import (
     SelectPlanesTransform,
     NormalizeTransform,
-    GaussianFilterTransform,
     TransformPipeline,
     RemoveBackgroundTransform,
     CenterCellTransform,
@@ -263,53 +262,6 @@ class TestNormalizeTransform:
         for plane in result.channels["405"]:
             assert plane.min() >= 0
             assert plane.max() <= 1
-
-
-class TestGaussianFilterTransform:
-    """Test GaussianFilterTransform."""
-
-    def test_gaussian_smoothing(self):
-        """Test Gaussian smoothing reduces noise."""
-        transform = GaussianFilterTransform(sigma=2.0, channel_keys=["405"])
-
-        # Create noisy image
-        np.random.seed(42)
-        channel_data = np.ones((250, 250)) * 100
-        noise = np.random.randn(250, 250) * 20
-        channel_data += noise
-
-        channels = {"405": [channel_data.copy()]}
-        cell_data = CellData(cell_id="test", channels=channels, segmentation=[np.zeros((250, 250))])
-
-        result = transform(cell_data)
-
-        # Smoothed image should have less variance
-        original_std = channel_data.std()
-        smoothed_std = result.channels["405"][0].std()
-        assert smoothed_std < original_std
-
-    def test_different_sigma_values(self):
-        """Test different sigma values."""
-        channel_data = np.random.randn(250, 250) * 10 + 50
-
-        # Small sigma
-        transform_small = GaussianFilterTransform(sigma=0.5, channel_keys=["405"])
-        # Large sigma
-        transform_large = GaussianFilterTransform(sigma=5.0, channel_keys=["405"])
-
-        cell_data = CellData(
-            cell_id="test",
-            channels={"405": [channel_data.copy()]},
-            segmentation=[np.zeros((250, 250))],
-        )
-
-        result_small = transform_small(cell_data)
-        result_large = transform_large(cell_data)
-
-        # Larger sigma should smooth more (lower std)
-        std_small = result_small.channels["405"][0].std()
-        std_large = result_large.channels["405"][0].std()
-        assert std_large < std_small
 
 
 def make_image(shape=(10, 12), fill=100.0):
