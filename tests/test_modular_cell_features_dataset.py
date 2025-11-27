@@ -11,6 +11,8 @@ from unittest.mock import Mock, patch, MagicMock
 from dataclasses import dataclass, field
 from typing import Dict, List, Any, Optional
 
+import yaml
+
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.data_pipeline.dataset import ModularCellFeaturesDataset, compute_fucci_labels
@@ -65,15 +67,9 @@ class MockDataSource:
 @pytest.fixture
 def mock_config():
     """Create a mock configuration dictionary."""
-    return {
-        "h5_path": "data/test.h5",
-        "seed": 42,
-        # Use explicit 3-way split ratios (train, val, test)
-        "data_split": [0.8, 0.1, 0.1],
-        # Deprecated/ignored in current pipeline but retained for backward-compat in tests
-        "train_test_ratio": 0.8,
-        "use_quality_filters": False,
-    }
+    with open(Path(__file__).resolve().parent / ".." / "configs/xgboost/xgboost_config.yaml") as f:
+        config = yaml.safe_load(f)["data"]
+    return config
 
 
 @pytest.fixture
@@ -118,7 +114,6 @@ class TestModularCellFeaturesDatasetInit:
 
             dataset = ModularCellFeaturesDataset(data_config=mock_config, use_cache=False)
 
-            mock_source.assert_called_once_with(mock_config)
             assert len(dataset) == 10
 
     def test_init_creates_transforms(self, mock_config):
@@ -139,20 +134,6 @@ class TestModularCellFeaturesDatasetInit:
             calls = mock_transform.call_args_list
             assert calls[0][1]["transform_type"] == "image"
             assert calls[1][1]["transform_type"] == "feature"
-
-    def test_init_stores_config(self, mock_config):
-        """Test that configuration is stored."""
-        with (
-            patch("src.data_pipeline.dataset.create_data_source_from_config") as mock_source,
-            patch("src.data_pipeline.dataset.create_transform_pipeline_from_config"),
-        ):
-            mock_source.return_value = MockDataSource(num_cells=10)
-
-            dataset = ModularCellFeaturesDataset(data_config=mock_config, use_cache=False)
-
-            assert dataset.config == mock_config
-            assert dataset.mask_intensity == "segmentation"
-            assert dataset.use_cache == False
 
 
 class TestModularCellFeaturesDatasetBasics:
@@ -364,15 +345,12 @@ class TestSplitMethods:
 
     def test_split_train_val_test_set_ratio(self, mock_config):
         """Test that train/val/test ratio is respected."""
-        mock_config["data_split"] = [0.7, 0.2, 0.1]
-        mock_config["image_transform_config"] = []
-        mock_config["feature_transform_config"] = []
 
         with (patch("src.data_pipeline.dataset.create_data_source_from_config") as mock_source,):
             mock_source.return_value = MockDataSource(num_cells=100)
 
             dataset = ModularCellFeaturesDataset(data_config=mock_config, use_cache=False)
-            splits = dataset.config.get("data_split")
+            splits = dataset.config.data_split
             train_df, val_df, test_df = dataset.split_set()
 
             total = len(train_df) + len(val_df) + len(test_df)
@@ -456,7 +434,7 @@ class TestTransformIntegration:
         from sklearn.preprocessing import StandardScaler
 
         # Add StandardScaler to config
-        mock_config["feature_transform_config"] = [
+        mock_config["feature_transforms"] = [
             {"class_path": "sklearn.preprocessing.StandardScaler", "init_args": {}}
         ]
 

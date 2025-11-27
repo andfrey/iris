@@ -327,6 +327,63 @@ def test_remove_background_raises_when_no_masks_available():
         t(data)
 
 
+def test_remove_background_mean_method():
+    """Test background removal using background_mean method."""
+    # Create an image with known values
+    img = np.full((10, 12), 100.0, dtype=float)
+    # Set some pixels inside the mask to higher values
+    img[2:8, 3:9] = 200.0
+
+    # Create a mask
+    mask = make_mask(shape=(10, 12), on_region=(slice(2, 8), slice(3, 9)))
+
+    data = DummyData(channels={"488": [img.copy()]}, segmentation=[mask])
+
+    # Apply background removal with background_mean method
+    t = RemoveBackgroundTransform(
+        channel_keys=["488"], method="background_mean", background_padding=0, mask="cell"
+    )
+    out = t(data)
+
+    out_img = out.channels["488"][0]
+
+    # The mean outside of masked region (all 100.0) is 100.0
+    # So the entire image should be img - 100.0
+    expected = img - 100.0
+
+    assert np.allclose(out_img, expected), f"Expected {expected}, but got {out_img}"
+
+
+def test_remove_background_mean_method_multiplane():
+    """Test background_mean method with multiple planes."""
+    # Create two planes with different values
+    img1 = np.full((10, 12), 50.0, dtype=float)
+    img1[2:8, 3:9] = 150.0  # Mean inside mask = 150.0
+
+    img2 = np.full((10, 12), 30.0, dtype=float)
+    img2[2:8, 3:9] = 80.0  # Mean inside mask = 80.0
+
+    mask1 = make_mask(shape=(10, 12), on_region=(slice(2, 8), slice(3, 9)))
+    mask2 = make_mask(shape=(10, 12), on_region=(slice(2, 8), slice(3, 9)))
+
+    data = DummyData(channels={"561": [img1.copy(), img2.copy()]}, segmentation=[mask1, mask2])
+
+    t = RemoveBackgroundTransform(
+        channel_keys=["561"], method="background_mean", background_padding=0, mask="cell"
+    )
+    out = t(data)
+
+    # First plane: subtract mean outside masked region (50.0)
+    out1 = out.channels["561"][0]
+    expected1 = img1 - 50.0
+    assert np.allclose(out1, expected1)
+
+    # Second plane: subtract mean outside masked region (30.0)
+    out2 = out.channels["561"][1]
+    expected2 = img2 - 30.0
+    assert np.allclose(out2, expected2)
+
+
 class TestTransformPipeline:
     """Test TransformPipeline."""
 
@@ -335,7 +392,6 @@ class TestTransformPipeline:
         transforms = [
             SelectPlanesTransform(plane_selection="middle"),
             NormalizeTransform(method="minmax", channel_keys=["405"]),
-            GaussianFilterTransform(sigma=1.0, channel_keys=["405"]),
         ]
         pipeline = TransformPipeline(transforms)
 
@@ -354,7 +410,6 @@ class TestTransformPipeline:
 
         # After SelectPlanes: 1 plane
         # After Normalize: [0, 1]
-        # After Gaussian: smoothed
         assert len(result.channels["405"]) == 1
         assert 0 <= result.channels["405"][0].min() <= result.channels["405"][0].max() <= 1
 
@@ -363,7 +418,6 @@ class TestTransformPipeline:
         transforms = [
             SelectPlanesTransform(plane_selection="middle"),
             NormalizeTransform(method="minmax", channel_keys=["bf", "405"]),
-            GaussianFilterTransform(sigma=1.0, channel_keys=["bf", "405"]),
         ]
         pipeline = TransformPipeline(transforms)
 

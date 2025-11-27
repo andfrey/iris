@@ -5,7 +5,7 @@ Composable transforms that can be chained together.
 
 from abc import ABC, abstractmethod
 import importlib
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Literal
 import cv2
 import numpy as np
 from scipy import ndimage
@@ -61,10 +61,12 @@ class RemoveBackgroundTransform(Transform):
     def __init__(
         self,
         channel_keys: Optional[List[str]] = None,
+        method: Literal["background_content", "background_mean"] = "background_content",
         background_padding: int = 15,
         mask: str = "cell",
     ):
         self.channel_keys = channel_keys
+        self.method = method
         self.background_padding = background_padding
         self.mask = mask  # 'cell' or 'nuclei'
         if mask not in ["cell", "nuclei"]:
@@ -84,14 +86,16 @@ class RemoveBackgroundTransform(Transform):
                     )
                 # Transform each plane
                 if isinstance(planes, list):
-                    data.channels[key] = self._remove_background(planes, masks)
+                    data.channels[key] = self._remove_background(planes, masks, method=self.method)
                 else:
-                    data.channels[key] = self._remove_background([planes], [masks])
+                    data.channels[key] = self._remove_background(
+                        [planes], [masks], method=self.method
+                    )
 
         return data
 
     def _remove_background(
-        self, images: List[np.ndarray], masks: List[np.ndarray]
+        self, images: List[np.ndarray], masks: List[np.ndarray], method: str = "background_content"
     ) -> List[np.ndarray]:
         # Subtract background
         for image, mask in zip(images, masks):
@@ -101,23 +105,29 @@ class RemoveBackgroundTransform(Transform):
                 ]  # Use middle plane if no mask provided has less than 10 pixels
                 if mask is None:
                     raise ValueError("No segmentation mask available for background removal")
-            mask_height, mask_width = mask.shape
-            # Pad mask
-            if self.background_padding > 0:
-                mask = cv2.resize(
-                    mask,
-                    (
-                        mask_width + self.background_padding * 2,
-                        mask_height + self.background_padding * 2,
-                    ),
-                    interpolation=cv2.INTER_CUBIC,
-                )
-                mask = mask[
-                    self.background_padding : -self.background_padding,
-                    self.background_padding : -self.background_padding,
-                ]
-            image[mask == 0] = 0.0
-
+            if method == "background_content":
+                mask_height, mask_width = mask.shape
+                # Pad mask
+                if self.background_padding > 0:
+                    mask = cv2.resize(
+                        mask,
+                        (
+                            mask_width + self.background_padding * 2,
+                            mask_height + self.background_padding * 2,
+                        ),
+                        interpolation=cv2.INTER_CUBIC,
+                    )
+                    mask = mask[
+                        self.background_padding : -self.background_padding,
+                        self.background_padding : -self.background_padding,
+                    ]
+                image[mask == 0] = 0.0
+            elif method == "background_mean":
+                background = image[mask == 0]
+                background_mean = background.mean() if background.size > 0 else 0.0
+                image[:, :] = image - background_mean
+            else:
+                raise ValueError(f"Unknown background removal method: {method}")
         return images
 
     def get_config(self) -> Dict[str, Any]:
@@ -374,7 +384,6 @@ class NormalizeTransform(ChannelTransform):
                 normalized = (image - mean) / std
             else:
                 normalized = image - mean
-
         else:
             raise ValueError(f"Unknown normalization method: {self.method}")
 
@@ -491,7 +500,7 @@ def create_transform_pipeline_from_config(transforms: List, transform_type: str 
         from sklearn.pipeline import Pipeline
 
         transform_pipeline = Pipeline(
-            steps=[(repr(transform), transform) for transform in transforms]
+            steps=[(repr(transform), transform) for transform in resolved_transforms]
         )
 
     return transform_pipeline
