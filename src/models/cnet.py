@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 from typing import List, Optional
 
-from src.models.base_model import BaseRegressionModel
+from src.models.base_model import BaseRegressionModel, VonMisesLoss
 
 
 class ConvBlock(nn.Module):
@@ -32,7 +32,7 @@ class ConvBlock(nn.Module):
         if use_batchnorm:
             layers.append(nn.BatchNorm2d(out_channels))
 
-        layers.append(nn.ReLU(inplace=True))
+        layers.append(nn.ReLU())
 
         self.block = nn.Sequential(*layers)
 
@@ -106,6 +106,7 @@ class CNet(BaseRegressionModel):
         optimizer: str = "adam",
         scheduler: Optional[str] = "plateau",
         weight_decay: float = 1e-4,
+        loss: str = "geodesic_squared_distance",
     ):
         # Initialize base class with training parameters
         super().__init__(
@@ -149,11 +150,21 @@ class CNet(BaseRegressionModel):
             current_channels + feature_dim
         )  # Add feature_dim if using additional features
 
+        self.loss = loss
+        # Create criterion for this model if dim 1 we predict the position on a cyclic curve
+        if loss == "geodesic_squared_distance":
+            self.criterion = ABSResiduals(cyclic=(output_dim == 1))
+        elif loss == "von_mises":
+            self.criterion = VonMisesLoss()
+            output_dim += 1
+        else:
+            raise ValueError(f"Unsupported loss function: {loss}")
+
         for hidden_dim in fc_hidden_dims:
             fc_layers.extend(
                 [
                     nn.Linear(fc_input_dim, hidden_dim),
-                    nn.ReLU(inplace=True),
+                    nn.ReLU(),
                     nn.Dropout(dropout),
                 ]
             )
@@ -162,9 +173,6 @@ class CNet(BaseRegressionModel):
         # Output layer
         fc_layers.append(nn.Linear(fc_input_dim, output_dim))
         self.fc = nn.Sequential(*fc_layers)
-
-        # Create criterion for this model if dim 1 we predict the position on a cyclic curve
-        self.criterion = ABSResiduals(cyclic=(output_dim == 1))
 
     def get_criterion(self) -> nn.Module:
         """Return the loss function for this model"""
@@ -184,12 +192,13 @@ class CNet(BaseRegressionModel):
             For regression: predictions of shape (batch_size, output_dim)
         """
 
+        if feature_x is None and isinstance(image_x, tuple):
+            image_x, feature_x = image_x
         # Ensure input is float32
         if image_x.dtype != torch.float32:
             image_x = image_x.float()
         if feature_x is not None and feature_x.dtype != torch.float32:
             feature_x = feature_x.float()
-
         # Convolutional blocks
         for block in self.conv_blocks:
             image_x = block(image_x)
@@ -206,5 +215,9 @@ class CNet(BaseRegressionModel):
         else:
             x = conv_x
         x = self.fc(x)
-
+        if self.loss == "von_mises":
+            # For von Mises, output is [predictions, kappa]
+            x_pred = x[:, : self.output_dim]
+            x_kappa = torch.nn.functional.softplus(x[:, -1]) + 1e-3  # Ensure kappa is positive
+            x = (x_pred, x_kappa)
         return x

@@ -9,6 +9,7 @@ from typing import Dict, Optional, Union
 import numpy as np
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 from scipy.optimize import minimize
+from scipy.stats import circmean
 
 
 @dataclass
@@ -175,6 +176,9 @@ class MetricComputer:
         def objective(t):
             return sum(self.projector.geodesic_distance(ti, t) ** 2 for ti in phases)
 
-        result = minimize(objective, x0=np.median(phases), method="L-BFGS-B", bounds=[(0, 1)])
+        result = minimize(
+            objective, x0=circmean(phases, high=1.0, low=0.0), method="L-BFGS-B", bounds=[(0, 1)]
+        )
+        # result = minimize(objective, x0=np.median(phases), method="L-BFGS-B", bounds=[(0, 1)])
         self.frechet_mean = result.x[0]
         return self.frechet_mean

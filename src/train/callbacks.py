@@ -29,6 +29,7 @@ class EvaluationCallback(Callback):
         # Storage for predictions/targets
         self.train_outputs = []
         self.val_outputs = []
+        self.test_outputs = []
 
     def setup(self, trainer, pl_module, stage):
         """Initialize evaluator with projector if available"""
@@ -51,6 +52,9 @@ class EvaluationCallback(Callback):
         else:
             if "residual" not in self.eval_config.plots_to_generate:
                 self.eval_config.plots_to_generate.append("residual")
+        if pl_module.loss == "von_mises":
+            if "von_mises_kappa_uncertainty" not in self.eval_config.plots_to_generate:
+                self.eval_config.plots_to_generate.append("von_mises_kappa_uncertainty")
 
         self.evaluator = Evaluator(config=self.eval_config, projector=projector)
 
@@ -61,6 +65,9 @@ class EvaluationCallback(Callback):
                 {
                     "preds": outputs["preds"].detach().cpu().numpy(),
                     "targets": outputs["targets"].detach().cpu().numpy(),
+                    "kappa": outputs.get("kappa").detach().cpu().numpy()
+                    if outputs.get("kappa", None) is not None
+                    else None,
                 }
             )
 
@@ -73,6 +80,22 @@ class EvaluationCallback(Callback):
                 {
                     "preds": outputs["preds"].detach().cpu().numpy(),
                     "targets": outputs["targets"].detach().cpu().numpy(),
+                    "kappa": outputs.get("kappa").detach().cpu().numpy()
+                    if outputs.get("kappa", None) is not None
+                    else None,
+                }
+            )
+
+    def on_test_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx=0):
+        """Collect validation predictions"""
+        if outputs is not None and "preds" in outputs and "targets" in outputs:
+            self.test_outputs.append(
+                {
+                    "preds": outputs["preds"].detach().cpu().numpy(),
+                    "targets": outputs["targets"].detach().cpu().numpy(),
+                    "kappa": outputs.get("kappa").detach().cpu().numpy()
+                    if outputs.get("kappa", None) is not None
+                    else None,
                 }
             )
 
@@ -80,13 +103,15 @@ class EvaluationCallback(Callback):
         """Evaluate training set"""
         if not self.train_outputs:
             return
-
-        y_true = np.concatenate([x["targets"] for x in self.train_outputs])
+        if pl_module.loss == "von_mises":
+            kappa_values = np.concatenate([x["kappa"] for x in self.train_outputs])
+        else:
+            kappa_values = None
         y_pred = np.concatenate([x["preds"] for x in self.train_outputs])
+        y_true = np.concatenate([x["targets"] for x in self.train_outputs])
 
         # Use centralized evaluator
-        result = self.evaluator.evaluate(y_true, y_pred, prefix="train")
-
+        result = self.evaluator.evaluate(y_true, y_pred, prefix="train", kappa_values=kappa_values)
         # Log to W&B
         if trainer.logger is not None:
             result.log_to_wandb(trainer.logger.experiment, prefix="train")
@@ -104,13 +129,15 @@ class EvaluationCallback(Callback):
         """Evaluate validation set"""
         if not self.val_outputs or trainer.sanity_checking:
             return
-
-        y_true = np.concatenate([x["targets"] for x in self.val_outputs])
+        if pl_module.loss == "von_mises":
+            kappa_values = np.concatenate([x["kappa"] for x in self.val_outputs])
+        else:
+            kappa_values = None
         y_pred = np.concatenate([x["preds"] for x in self.val_outputs])
+        y_true = np.concatenate([x["targets"] for x in self.val_outputs])
 
         # Use centralized evaluator
-        result = self.evaluator.evaluate(y_true, y_pred, prefix="val")
-
+        result = self.evaluator.evaluate(y_true, y_pred, prefix="val", kappa_values=kappa_values)
         # Log to W&B
         if trainer.logger is not None:
             result.log_to_wandb(trainer.logger.experiment, prefix="val")
@@ -126,6 +153,35 @@ class EvaluationCallback(Callback):
 
         # Clear storage
         self.val_outputs = []
+
+    def on_test_epoch_end(self, trainer, pl_module):
+        """Evaluate validation set"""
+        if not self.test_outputs or trainer.sanity_checking:
+            return
+        if pl_module.loss == "von_mises":
+            kappa_values = np.concatenate([x["kappa"] for x in self.test_outputs])
+        else:
+            kappa_values = None
+        y_pred = np.concatenate([x["preds"] for x in self.test_outputs])
+        y_true = np.concatenate([x["targets"] for x in self.test_outputs])
+
+        # Use centralized evaluator
+        result = self.evaluator.evaluate(y_true, y_pred, prefix="test", kappa_values=kappa_values)
+
+        # Log to W&B
+        if trainer.logger is not None:
+            result.log_to_wandb(trainer.logger.experiment, prefix="test")
+        # log_regression_plots(
+        #     y_true,
+        #     y_pred,
+        #     trainer.logger.experiment,
+        #     "test",
+        # )
+        pl_module.test_predictions = []
+        pl_module.test_targets = []
+
+        # Clear storage
+        self.test_outputs = []
 
 
 class DebugCallback(Callback):

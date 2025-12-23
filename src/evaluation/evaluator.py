@@ -23,7 +23,7 @@ class EvaluationConfig:
     plots_to_generate: List[str] = field(
         default_factory=lambda: [
             "scatter",
-            "residual",
+            "geodesic_residual",
         ]
     )
 
@@ -36,6 +36,7 @@ class EvaluationConfig:
             "true_residuals",
             "fucci_color_comparison",
             "geodesic_residual",
+            "von_mises_kappa_uncertainty",
         }
 
         for plot_type in self.plots_to_generate:
@@ -119,6 +120,7 @@ class Evaluator:
         self,
         y_true: np.ndarray,
         y_pred: np.ndarray,
+        kappa_values: Optional[np.ndarray] = None,
         prefix: str = "",
     ) -> EvaluationResult:
         """
@@ -141,7 +143,7 @@ class Evaluator:
         y_true, y_pred = self._filter_data(y_true, y_pred)
 
         # Generate plots
-        plots = self._generate_plots(y_true, y_pred, prefix)
+        plots = self._generate_plots(y_true, y_pred, prefix, kappa_values=kappa_values)
 
         return EvaluationResult(metrics=metrics, plots=plots)
 
@@ -164,6 +166,7 @@ class Evaluator:
         y_pred: np.ndarray,
         prefix: str,
         residuals: Optional[np.ndarray] = None,
+        kappa_values: Optional[np.ndarray] = None,
     ) -> Dict[str, plt.Figure]:
         """Generate all configured plots"""
         plots = {}
@@ -206,12 +209,20 @@ class Evaluator:
                     y_true, y_pred, title=f"{prefix} FUCCI Color Distribution"
                 )
 
-            elif plot_type == "geodesic_residual" and self.config.is_phase:
+            elif plot_type == "geodesic_residual":
                 plots[f"geodesic_residual"] = self.plot_generator.geodesic_residual_plot(
                     y_true,
                     y_pred,
                     residuals=residuals,
                     title=f"{prefix} Geodesic Residual Plot",
                 )
-
+            elif plot_type == "von_mises_kappa_uncertainty":
+                plots[
+                    f"von_mises_kappa_uncertainty"
+                ] = self.plot_generator.von_mises_kappa_uncertainty_plot(
+                    y_true,
+                    y_pred,
+                    kappa_values=kappa_values,
+                    title=f"{prefix} Von Mises Kappa Uncertainty Plot",
+                )
         return plots

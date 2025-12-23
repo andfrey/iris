@@ -14,6 +14,41 @@ from typing import Optional, Dict, Any, Tuple
 from abc import abstractmethod
 
 
+class VonMisesLoss(nn.Module):
+    """MLE loss for von Mises distribution."""
+
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, predictions, targets, von_mises_kappa=None):
+        """
+        Compute mean squared geodesic distance.
+
+        Args:
+            predictions: Tensor [B, 1] with predicted phases
+            targets: Tensor [B, 1] with true phases
+
+        Returns:
+            Mean squared geodesic distance
+        """
+        if von_mises_kappa is None:
+            von_mises_kappa = torch.tensor(1.0, device=predictions.device)
+
+        von_mises_kappa = von_mises_kappa.view(-1, 1)
+        # If using von Mises distribution, apply circular transformation
+        predictions_angle = (predictions - 0.5) * 2 * torch.pi
+        targets_angle = (targets - 0.5) * 2 * torch.pi
+        # Stability Trick: log(I0(k)) = k + log(i0e(k))
+        log_bessel = von_mises_kappa + torch.log(torch.special.i0e(von_mises_kappa))
+
+        # Loss = - (kappa * cos(diff) - log_bessel)
+        #      = log_bessel - kappa * cos(diff)
+        loss = torch.mean(
+            log_bessel - von_mises_kappa * torch.cos(predictions_angle - targets_angle)
+        )
+        return loss
+
+
 class BaseRegressionModel(L.LightningModule):
     """
     Base class for regression models with Lightning training.
@@ -99,10 +134,13 @@ class BaseRegressionModel(L.LightningModule):
         - Make 1D tensors into (B, 1) shape
         """
         y = y.float()
-        preds = preds.float()
+        preds = preds.float() if not isinstance(preds, tuple) else tuple(p.float() for p in preds)
         if y.dim() == 1:
             y = y.view(-1, 1)
-        if preds.dim() == 1:
+        if isinstance(preds, tuple):
+            if preds[0].dim() == 1 and preds[1].dim() == 1:
+                preds = (preds[0].view(-1, 1), preds[1].view(-1, 1))
+        elif preds.dim() == 1:
             preds = preds.view(-1, 1)
         return preds, y
 
@@ -130,8 +168,15 @@ class BaseRegressionModel(L.LightningModule):
             (loss, adjusted_predictions)
         """
         criterion = self.get_criterion()
-        abs_residuals = criterion(preds, targets)
-        loss = (abs_residuals**2).mean()
+        kappa = None
+        if isinstance(criterion, VonMisesLoss):
+            # For Von Mises, preds is a tuple (predictions, kappa)
+            preds, kappa = preds
+            loss = criterion(preds, targets, von_mises_kappa=kappa)
+            abs_residuals = torch.abs(((preds - targets + 0.5) % 1.0) - 0.5)
+        else:
+            abs_residuals = criterion(preds, targets)
+            loss = (abs_residuals**2).mean()
 
         # For geodesic/circular data (1D output), adjust predictions
         if preds.shape[1] == 1:
@@ -143,7 +188,7 @@ class BaseRegressionModel(L.LightningModule):
         mae = abs_residuals.mean()
         mse = loss
 
-        return loss, y_hat, mae, mse
+        return loss, y_hat, mae, mse, kappa
 
     def _step(self, batch, stage: str) -> Dict[str, torch.Tensor]:
         """
@@ -168,7 +213,7 @@ class BaseRegressionModel(L.LightningModule):
         preds, y = self._normalize_shapes(preds, y)
 
         # Compute loss
-        loss, y_hat, mae, mse = self._compute_loss(preds, y)
+        loss, y_hat, mae, mse, kappa = self._compute_loss(preds, y)
 
         # Log metrics
         self.log(
@@ -186,6 +231,7 @@ class BaseRegressionModel(L.LightningModule):
             "loss": loss,
             "preds": y_hat,
             "targets": y,
+            "kappa": kappa,
         }
 
     def training_step(self, batch, batch_idx):
@@ -254,7 +300,7 @@ class BaseRegressionModel(L.LightningModule):
                 },
             }
         elif self.scheduler_name.lower() == "cosine":
-            scheduler = CosineAnnealingLR(optimizer, T_max=100, eta_min=1e-6)
+            scheduler = CosineAnnealingLR(optimizer, T_max=150, eta_min=1e-6)
             return [optimizer], [scheduler]
         elif self.scheduler_name.lower() == "step":
             scheduler = StepLR(optimizer, step_size=10, gamma=0.5)

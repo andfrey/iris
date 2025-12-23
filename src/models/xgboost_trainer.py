@@ -52,9 +52,10 @@ class XGBoostCellCycleTrainer:
         self.val_data = val_data
         self.dataset = dataset
         self.features_columns = [
-            col for col in training_data.columns if not col.startswith("label_")
+            col for col in training_data.columns if not col.startswith("label_") or col != "phase"
         ]
         self.wandb_run = wandb_run
+        self.evaluator = evaluator
 
         self.model = None
         self.X_train = None
@@ -106,7 +107,7 @@ class XGBoostCellCycleTrainer:
         )
         # Evaluate and log metrics
         metrics = self.evaluate()
-        self.log_feature_importance()
+        # self.log_feature_importance()
         return self.model, metrics
 
     def predict(self, X: np.ndarray) -> np.ndarray:
@@ -126,41 +127,40 @@ class XGBoostCellCycleTrainer:
         metrics = {}
 
         train_evaluation = self.evaluator.evaluate(
-            self.y_train,
+            self.y_train.squeeze(),
             self.model.predict(self.X_train),
             prefix="train",
-            wandb_run=self.wandb_run,
-            plot=False,
         )
+        train_evaluation.log_to_wandb(wandb_run=self.wandb_run, prefix="train")
         metrics.update(train_evaluation.metrics.to_dict(prefix="train"))
         val_evaluation = self.evaluator.evaluate(
-            self.y_val,
+            self.y_val.squeeze(),
             self.model.predict(self.X_val),
             prefix="val",
-            wandb_run=self.wandb_run,
         )
+        val_evaluation.log_to_wandb(wandb_run=self.wandb_run, prefix="val")
         metrics.update(val_evaluation.metrics.to_dict(prefix="val"))
         for plot_name, fig in val_evaluation.plots.items():
             self.wandb_run.log({f"{plot_name}": wandb.Image(fig)})
             fig.clf()
         return metrics
 
-    def log_feature_importance(self):
-        """Log feature importances using model's booster."""
-        if self.model is None:
-            print("Model not trained yet. Cannot log feature importances.")
-            return
-        importances = self.model.feature_importances_
+    # def log_feature_importance(self):
+    #     """Log feature importances using model's booster."""
+    #     if self.model is None:
+    #         print("Model not trained yet. Cannot log feature importances.")
+    #         return
+    #     importances = self.model.feature_importances_
 
-        feature_names = self.features_columns
+    #     feature_names = self.features_columns
 
-        importance_df = pd.DataFrame(
-            {"feature": feature_names, "importance": importances}
-        ).sort_values("importance", ascending=False)
-        print("Feature importances:")
-        print(importance_df)
-        if self.wandb_run is not None:
-            self.wandb_run.log({"feature_importance": wandb.Table(dataframe=importance_df)})
+    #     importance_df = pd.DataFrame(
+    #         {"feature": feature_names, "importance": importances}
+    #     ).sort_values("importance", ascending=False)
+    #     print("Feature importances:")
+    #     print(importance_df)
+    #     if self.wandb_run is not None:
+    #         self.wandb_run.log({"feature_importance": wandb.Table(dataframe=importance_df)})
 
     def save_model(self, path: str):
         """Save trained model to disk.

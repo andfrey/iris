@@ -1,60 +1,36 @@
 # Evaluation function for regression models
 from typing import Any, Dict, Tuple
-
+import sys
+from pathlib import Path
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 import numpy as np
 from sympy import im
 import wandb
 
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-def evaluate_regression(y, preds, prefix, wandb_run, plot=True):
-    """
-    Compute regression metrics and optionally log diagnostic plots to W&B.
-
-    Args:
-        y (np.ndarray): True target values.
-        preds (np.ndarray): Predicted values from the model.
-        prefix (str): Prefix for metric names (e.g., 'val', 'test').
-        wandb_run: Optional Weights & Biases run for logging metrics and plots.
-        plot (bool): If True, log diagnostic plots to W&B.
-
-    Returns:
-        dict: Dictionary of regression metrics (MSE, MAE, R2) with prefix.
-    """
-    mse = mean_squared_error(y, preds)
-    mae = mean_absolute_error(y, preds)
-    r2 = r2_score(y, preds)
-
-    # y = np.where(y < 0.0001, 0.0001, y)
-    # preds = np.where(preds < 0.0001, 0.0001, preds)
-    # log_mse = mean_squared_error(np.log(y), np.log(preds))
-    # log_mae = mean_absolute_error(np.log(y), np.log(preds))
-    # log_r2 = r2_score(np.log(y), np.log(preds))
-
-    metrics = {
-        f"{prefix}_mse": mse,
-        f"{prefix}_mae": mae,
-        f"{prefix}_r2": r2,
-        # f"{prefix}_log_mse": log_mse,
-        # f"{prefix}_log_mae": log_mae,
-        # f"{prefix}_log_r2": log_r2,
-    }
-
-    if wandb_run is not None:
-        wandb_run.log(metrics)
-    if plot and wandb_run is not None:
-        log_regression_plots(y, preds, wandb_run, prefix)
-
-    return metrics
+from src.evaluation.evaluation import fucci_color_comparison
 
 
-def log_regression_plots(y, preds, wandb_run, prefix):
+def log_regression_plots(y, preds, wandb_run, prefix, is_cyclic=False):
     """
     Log a standard suite of regression plots to W&B.
 
     This automatically handles 1D targets (e.g., phase) and 2D targets (FUCCI intensities) and
     logs: true residual diagnostics, prediction scatter, true-vs-pred per target, and residual plots.
+
+    Args:
+        y: True target values
+        preds: Predicted values
+        wandb_run: Weights & Biases run for logging
+        prefix: Prefix for plot names
+        is_cyclic: If True, also create circular residual plot for phase data
     """
+    # Filter out negative values in y and corresponding predictions
+    mask = (y[:, 0] >= 0) & (y[:, 1] >= 0) if y.shape[1] == 2 else y[:, 0] >= 0
+    y = y[mask]
+    preds = preds[mask]
+
     log_plot(
         y,
         preds=preds,
@@ -73,7 +49,6 @@ def error_heatmap_plot(fig, ax, x, y_, errors_norm, error_label, bins=250, title
         y_: 1D array for y-axis (e.g., true or predicted 561 intensity)
         errors_norm: 1D array of error norms
         bins: Number of bins for the heatmap
-        log_scale: Whether axes are log-transformed
         title: Optional plot title
     Returns:
         fig, ax: Matplotlib figure and axis
@@ -115,18 +90,19 @@ def log_plot(y, preds, log_scale=True, title=None, wandb_run=None, prefix=None):
         preds = preds[:, None]
 
     n_targets = y.shape[1]
+    if n_targets != 1:
+        # Filter out negative values in y and corresponding predictions
+        mask = (y[:, 0] >= 0) & (y[:, 1] >= 0)
+        y = y[mask]
+        preds = preds[mask]
     channels = [(i, lbl) for i, lbl in enumerate(["488", "561"][:n_targets])]
     errors = y - preds
     errors_norm = np.abs(errors[:, 0]) if n_targets == 1 else np.linalg.norm(errors, axis=1)
 
     # 1) True residuals diagnostics
     if n_targets != 1:
-        if log_scale:
-            x = np.log(y[:, 0])
-            y_ = np.log(y[:, 1])
-        else:
-            x = y[:, 0]
-            y_ = y[:, 1]
+        x = y[:, 0]
+        y_ = y[:, 1]
         fig, axes = plt.subplots(1, 6, figsize=(36, 6))
         for i, (e_vals, label) in enumerate(
             (
@@ -137,8 +113,8 @@ def log_plot(y, preds, log_scale=True, title=None, wandb_run=None, prefix=None):
         ):
             i = i * 2
             sc = axes[i].scatter(x, y_, c=e_vals, cmap="Blues", alpha=0.7)
-            axes[i].set_xlabel(f"{'Log ' if log_scale else ''}488 True Intensity")
-            axes[i].set_ylabel(f"{'Log ' if log_scale else ''}561 True Intensity")
+            axes[i].set_xlabel(f"488 True Intensity")
+            axes[i].set_ylabel("561 True Intensity")
             axes[i].set_title(f"Residuals Scatter Plot {i+1}")
             fig.colorbar(sc, ax=axes[i], label=label)
 
@@ -150,46 +126,34 @@ def log_plot(y, preds, log_scale=True, title=None, wandb_run=None, prefix=None):
     # 2) Prediction scatter field (and 1D true-vs-pred)
     if n_targets == 1:
         fig2 = plt.figure(figsize=(8, 6))
-        y_true = np.log(y[:, 0]) if log_scale else y[:, 0]
-        y_pred = np.log(preds[:, 0]) if log_scale else preds[:, 0]
+        y_true = y[:, 0]
+        y_pred = preds[:, 0]
         abs_err = np.abs(errors[:, 0])
         sc = plt.scatter(y_true, y_pred, c=abs_err, cmap="Blues", alpha=0.7)
         axis_min = min(y_true.min(), y_pred.min())
         axis_max = max(y_true.max(), y_pred.max())
         plt.plot([axis_min, axis_max], [axis_min, axis_max], "r--", lw=1)
         plt.colorbar(sc, label="Absolute Residual")
-        plt.xlabel(f"{'Log ' if log_scale else ''}True Value")
-        plt.ylabel(f"{'Log ' if log_scale else ''}Predicted Value")
+        plt.xlabel("True Value")
+        plt.ylabel("Predicted Value")
         plt.title("Predicted vs True (1D)")
         if wandb_run is not None:
-            wandb_run.log({f"{prefix}_pred_scatter": wandb.Image(fig2)})
             wandb_run.log({f"{prefix}_true_vs_pred_scatter": wandb.Image(fig2)})
         plt.close(fig2)
     else:
         fig2 = plt.figure(figsize=(8, 6))
-        if log_scale:
-            plt.scatter(np.log(y[:, 0]), np.log(y[:, 1]), c="gray", alpha=0.2, label="True Labels")
-            sc = plt.scatter(
-                np.log(preds[:, 0]),
-                np.log(preds[:, 1]),
-                c=errors_norm,
-                cmap="Blues",
-                alpha=0.7,
-                label="Predictions",
-            )
-        else:
-            plt.scatter(y[:, 0], y[:, 1], c="gray", alpha=0.2, label="True Labels")
-            sc = plt.scatter(
-                preds[:, 0],
-                preds[:, 1],
-                c=errors_norm,
-                cmap="Blues",
-                alpha=0.7,
-                label="Predictions",
-            )
+        plt.scatter(y[:, 0], y[:, 1], c="gray", alpha=0.2, label="True Labels")
+        sc = plt.scatter(
+            preds[:, 0],
+            preds[:, 1],
+            c=errors_norm,
+            cmap="Blues",
+            alpha=0.7,
+            label="Predictions",
+        )
         plt.colorbar(sc, label="Norm Residuals")
-        plt.xlabel(f"{'Log ' if log_scale else ''}488 Predicted Intensity")
-        plt.ylabel(f"{'Log ' if log_scale else ''}561 Predicted Intensity")
+        plt.xlabel("488 Predicted Intensity")
+        plt.ylabel("561 Predicted Intensity")
         plt.title("Intensity Predictions Scatter Plot")
         plt.legend()
         if wandb_run is not None:
@@ -199,16 +163,16 @@ def log_plot(y, preds, log_scale=True, title=None, wandb_run=None, prefix=None):
         # True vs Pred per-channel
         fig3, axes3 = plt.subplots(1, 2, figsize=(12, 6))
         for ax, (i, label) in zip(axes3, channels):
-            xch = np.log(y[:, i]) if log_scale else y[:, i]
-            y_pred_ch = np.log(preds[:, i]) if log_scale else preds[:, i]
+            xch = y[:, i]
+            y_pred_ch = preds[:, i]
             ax.scatter(xch, y_pred_ch, alpha=0.7, label=label)
             axis_min = min(xch.min(), y_pred_ch.min())
             axis_max = max(xch.max(), y_pred_ch.max())
             ax.plot(
                 [axis_min, axis_max], [axis_min, axis_max], linestyle="--", color="red", linewidth=1
             )
-            ax.set_xlabel(f"{'Log ' if log_scale else ''}True Intensity ({label})")
-            ax.set_ylabel(f"{'Log ' if log_scale else ''}Predicted Intensity ({label})")
+            ax.set_xlabel(f"True Intensity ({label})")
+            ax.set_ylabel(f"Predicted Intensity ({label})")
             ax.set_title(f"{label}: Predicted vs True")
         plt.suptitle("Predicted vs True Scatter Plot")
         if wandb_run is not None:
@@ -218,7 +182,7 @@ def log_plot(y, preds, log_scale=True, title=None, wandb_run=None, prefix=None):
     # 3) Residuals plots
     if n_targets == 1:
         fig4, axes4 = plt.subplots(1, 2, figsize=(12, 5))
-        y_pred = np.log(preds[:, 0]) if log_scale else preds[:, 0]
+        y_pred = preds[:, 0]
         axes4[0].scatter(y_pred, errors[:, 0], alpha=0.7)
         axes4[0].set_xlabel("Predicted Value")
         axes4[0].set_ylabel("Residual: True - Predicted")
@@ -246,31 +210,95 @@ def log_plot(y, preds, log_scale=True, title=None, wandb_run=None, prefix=None):
             wandb_run.log({f"{prefix}_residuals_plot": wandb.Image(fig4)})
         plt.close(fig4)
 
+    # 4) Ground Truth Residuals Plot (for 2D intensity data)
+    if n_targets == 2:
+        fig5, axes5 = plt.subplots(1, 3, figsize=(18, 5))
 
-def train_val_split(
-    data: np.ndarray, labels: np.ndarray, split_ratio: float = 0.8, random_state: int = 42
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Randomly split data and labels into training and validation sets.
+        # Plot 1: Residuals in 488nm vs ground truth 488nm
+        scatter1 = axes5[0].scatter(
+            y[:, 0],
+            errors[:, 0],
+            alpha=0.6,
+            s=30,
+            c=np.abs(errors[:, 0]),
+            cmap="viridis",
+            edgecolors="k",
+            linewidth=0.5,
+        )
+        axes5[0].axhline(y=0, color="r", linestyle="--", linewidth=2, alpha=0.7)
+        axes5[0].set_xlabel("Ground Truth 488nm Intensity", fontsize=11)
+        axes5[0].set_ylabel("Residual: True - Pred (488nm)", fontsize=11)
+        axes5[0].set_title("488nm Channel Residuals vs Ground Truth", fontsize=12)
+        axes5[0].grid(True, alpha=0.3)
+        plt.colorbar(scatter1, ax=axes5[0], label="|Residual|")
 
-    Args:
-        data (np.ndarray): Feature data array.
-        labels (np.ndarray): Corresponding labels array.
-        split_ratio (float): Proportion of data to use for training (default 0.8).
-        random_state (int): Seed for reproducibility.
+        # Plot 2: Residuals in 561nm vs ground truth 561nm
+        scatter2 = axes5[1].scatter(
+            y[:, 1],
+            errors[:, 1],
+            alpha=0.6,
+            s=30,
+            c=np.abs(errors[:, 1]),
+            cmap="viridis",
+            edgecolors="k",
+            linewidth=0.5,
+        )
+        axes5[1].axhline(y=0, color="r", linestyle="--", linewidth=2, alpha=0.7)
+        axes5[1].set_xlabel("Ground Truth 561nm Intensity", fontsize=11)
+        axes5[1].set_ylabel("Residual: True - Pred (561nm)", fontsize=11)
+        axes5[1].set_title("561nm Channel Residuals vs Ground Truth", fontsize=12)
+        axes5[1].grid(True, alpha=0.3)
+        plt.colorbar(scatter2, ax=axes5[1], label="|Residual|")
 
-    Returns:
-        tuple: (X_train, y_train, X_val, y_val)
-    """
-    # Shuffle indices for random split
-    np.random.seed(random_state)
-    indices = np.arange(len(data))
-    np.random.shuffle(indices)
-    train_size = int(len(data) * split_ratio)
-    train_idx = indices[:train_size]
-    val_idx = indices[train_size:]
-    X_train = data[train_idx]
-    y_train = labels[train_idx]
-    X_val = data[val_idx]
-    y_val = labels[val_idx]
-    return X_train, y_train, X_val, y_val
+        # Plot 3: Norm of residuals vs norm of ground truth
+        gt_norm = np.linalg.norm(y, axis=1)
+        scatter3 = axes5[2].scatter(
+            gt_norm,
+            errors_norm,
+            alpha=0.6,
+            s=30,
+            c=errors_norm,
+            cmap="plasma",
+            edgecolors="k",
+            linewidth=0.5,
+        )
+        axes5[2].axhline(y=0, color="r", linestyle="--", linewidth=2, alpha=0.7)
+        axes5[2].set_xlabel("Ground Truth Intensity Norm", fontsize=11)
+        axes5[2].set_ylabel("Residual Norm", fontsize=11)
+        axes5[2].set_title("Combined Residual Norm vs Ground Truth", fontsize=12)
+        axes5[2].grid(True, alpha=0.3)
+        plt.colorbar(scatter3, ax=axes5[2], label="Residual Norm")
+
+        # Add statistics
+        mae_488 = np.mean(np.abs(errors[:, 0]))
+        mae_561 = np.mean(np.abs(errors[:, 1]))
+        mae_norm = np.mean(errors_norm)
+        rmse_norm = np.sqrt(np.mean(errors_norm**2))
+
+        stats_text = (
+            f"488nm MAE: {mae_488:.4f}\n"
+            f"561nm MAE: {mae_561:.4f}\n"
+            f"Norm MAE: {mae_norm:.4f}\n"
+            f"Norm RMSE: {rmse_norm:.4f}"
+        )
+
+        fig5.text(
+            0.98,
+            0.98,
+            stats_text,
+            transform=fig5.transFigure,
+            fontsize=10,
+            verticalalignment="top",
+            horizontalalignment="right",
+            bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.8),
+        )
+
+        plt.suptitle("Residuals vs Ground Truth Intensity", fontsize=14, y=1.02)
+        plt.tight_layout()
+
+        if wandb_run is not None:
+            wandb_run.log({f"{prefix}_gt_residuals_plot": wandb.Image(fig5)})
+        plt.close(fig5)
+
+        # 5) FUCCI Color Distribution Comparison
+        fucci_color_comparison(y, preds, wandb_run=wandb_run, prefix=prefix)
