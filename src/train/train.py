@@ -133,6 +133,12 @@ def parse_args():
         parents=[common_parser],
         help="Train with PyTorch Lightning and evaluate on validation/test sets",
     )
+    lightning_parser.add_argument(
+        "--holdout-exp-id",
+        type=str,
+        default=None,
+        help="Experiment ID to hold out for testing (leave-one-experiment-out)",
+    )
 
     # XGBoost backend
     xgb_parser = subparsers.add_parser(
@@ -237,18 +243,32 @@ def create_model(model_config: Optional[Dict[str, Any]]):
     model = model_config["model"]
 
     model = MODELS[model](**params)
+    # model = torch.compile(model)
     return model
 
 
 def run_lightning(
-    config: Dict, experiment_name: Optional[str] = None, project_name: Optional[str] = None
+    config: Dict,
+    experiment_name: Optional[str] = None,
+    project_name: Optional[str] = None,
+    holdout_exp_id: Optional[str] = None,
 ):
     """
     Run Lightning training with automatic validation and test evaluation.
 
     Args:
         config: Dictionary containing 'trainer', 'model', and 'data' config sections.
+        experiment_name: Optional experiment name override
+        project_name: Optional W&B project name override
+        holdout_exp_id: Optional experiment ID to hold out for testing (LOEO)
     """
+    # Update experiment name if doing LOEO
+    if holdout_exp_id:
+        experiment_name = f"holdout_{holdout_exp_id}_{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+    else:
+        experiment_name = experiment_name or config.get("experiment_name", "experiment")
+        experiment_name = experiment_name + "-" + datetime.now().strftime("%Y%m%d-%H%M%S")
+
     # load configs
     trainer_config = config.get("trainer", {})
     model_config = config.get("model", {})
@@ -258,8 +278,6 @@ def run_lightning(
 
     seed = trainer_config.get("seed", 42)
     project_name = project_name or config.get("project_name", None)
-    experiment_name = experiment_name or config.get("experiment_name", "experiment")
-    experiment_name = experiment_name + "-" + datetime.now().strftime("%Y%m%d-%H%M%S")
     # Set seed for reproducibility
     L.seed_everything(seed, workers=True)
 
@@ -278,7 +296,7 @@ def run_lightning(
     )
 
     datamodule = ModularCellDataModule(
-        data_config_path=data_config_path,
+        data_config_path=data_config_path, hold_out_exp_id=holdout_exp_id
     )
     datamodule.setup()
 
@@ -356,11 +374,15 @@ def xgboost_training_setup(
     """
 
     dataset = ModularCellFeaturesDataset(data_config=data_config)
-
+    evaluator = Evaluator(projector=dataset.projector)
     train_df, val_df, test_df = dataset.split_set()
 
     trainer = XGBoostCellCycleTrainer(
-        training_data=train_df, val_data=val_df, wandb_run=wandb_run, dataset=dataset
+        training_data=train_df,
+        val_data=val_df,
+        evaluator=evaluator,
+        wandb_run=wandb_run,
+        dataset=dataset,
     )
     return trainer, test_df, dataset
 
@@ -395,36 +417,35 @@ def train_and_evaluate_xgboost(
     if wandb_run:
         trainer.set_wandb_run(wandb_run)
     print("\nTraining XGBoost model...")
-    evaluator = Evaluator()
-    model, metrics = trainer.train(params=params, evaluator=evaluator)
+    model, metrics = trainer.train(params=params)
     model_path = None
-    if save_model:
-        model_path = f"checkpoints/xgboost/xgboost{model_suffix}_val_r2_{metrics['val_r2']:.4f}_val_mae_{metrics['val_mae']:.4f}.json"
-        os.makedirs(os.path.dirname(model_path), exist_ok=True)
-        trainer.save_model(model_path)
+    # if save_model:
+    #     model_path = f"checkpoints/xgboost/xgboost{model_suffix}_val_r2_{metrics['val_r2']:.4f}_val_mae_{metrics['val_mae']:.4f}.json"
+    #     os.makedirs(os.path.dirname(model_path), exist_ok=True)
+    #     trainer.save_model(model_path)
 
     if test_X is not None and test_y is not None:
-        test_evaluation = evaluator.evaluate(
-            test_y,
+        test_evaluation = trainer.evaluator.evaluate(
+            test_y.squeeze(),
             trainer.predict(test_X),
             prefix="test",
         )
         print(f"\nTest Metrics:")
         for k, v in test_evaluation.metrics.to_dict(prefix="test").items():
-            print(f"  {k}: {v:.4f}")
+            print(f"  {k}: {v}")
     else:
         test_evaluation = None
 
     if model_path:
         print(f"\n✓ Model saved to {model_path}")
     # Log model as artifact
-    artifact = wandb.Artifact(
-        name=f"xgboost-model-{wandb_run.id}",
-        type="model",
-        description=f"XGBoost model from sweep trial {wandb_run.name}",
-    )
-    artifact.add_file(str(model_path))
-    wandb_run.log_artifact(artifact)
+    # artifact = wandb.Artifact(
+    #     name=f"xgboost-model-{wandb_run.id}",
+    #     type="model",
+    #     description=f"XGBoost model from sweep trial {wandb_run.name}",
+    # )
+    # artifact.add_file(str(model_path))
+    # wandb_run.log_artifact(artifact)
     return trainer, metrics, test_evaluation.metrics.to_dict(prefix="test"), model_path
 
 
@@ -648,7 +669,13 @@ def main():
     project_name = args.project
     experiment_name = args.experiment_name
     if args.backend == "lightning":
-        run_lightning(config, project_name=project_name, experiment_name=experiment_name)
+        holdout_exp_id = getattr(args, "holdout_exp_id", None)
+        run_lightning(
+            config,
+            project_name=project_name,
+            experiment_name=experiment_name,
+            holdout_exp_id=holdout_exp_id,
+        )
     elif args.backend == "xgboost":
         if args.tune:
             # Run hyperparameter sweep
