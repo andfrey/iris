@@ -3,6 +3,7 @@ Modern PyTorch Dataset implementation using the new modular architecture.
 """
 
 from dataclasses import dataclass, field
+from sklearn.calibration import Parallel, delayed
 import yaml
 from typing import Optional, List, Dict, Any, Tuple, Union
 from copy import deepcopy
@@ -16,7 +17,7 @@ import numpy as np
 import lightning as L
 from tqdm import tqdm
 import pandas as pd
-
+import albumentations as A
 
 from .utils import (
     save_parquet_cache,
@@ -25,7 +26,7 @@ from .utils import (
 )
 from .data_sources import DataSource, CellData, DataSourceConfig, create_data_source_from_config
 from .data_transforms import Transform, create_transform_pipeline_from_config
-from .feature_extractor import FeatureExtractor
+from .feature_extractor import FeatureExtractor, polynomial_transform
 from .curve_projector import FucciCurveProjector
 
 
@@ -35,6 +36,7 @@ class DataModuleConfig:
     num_workers: int = 16
     data_split: List[float] = field(default_factory=lambda: [0.7, 0.2, 0.1])
     seed: int = 42
+    hold_out_exp_id: Optional[str] = None
 
 
 @dataclass
@@ -42,11 +44,13 @@ class DataSetConfig(DataModuleConfig):
     data_source: Optional[DataSourceConfig] = None
     image_transforms: List[Dict[str, Any]] = field(default_factory=list)
     feature_transforms: List[Dict[str, Any]] = field(default_factory=list)
+    features: List[str] = field(default_factory=list)
     augmentations: Optional[Dict[str, Any]] = None
     input_channels: List[str] = field(default_factory=lambda: ["bf", "405"])
     add_features: bool = False
+    polynomial: Optional[int] = None
     mask_intensity: str = "segmentation"
-    fucci_transform: Dict[str, Any] = field(default_factory=dict)
+    fucci_transform: str = "log"
     fucci_1D_projection: bool = False
     projection_shape: Optional[str] = None
 
@@ -81,13 +85,6 @@ class BaseCellDataset(Dataset):
         # Create data source
         self.data_source = create_data_source_from_config(self.config.data_source)
 
-        # Handle FUCCI transforms
-        if "scale" in self.config.fucci_transform:
-            self.scale_divider_488 = self.config.fucci_transform.get("scale_divider_488", 1.0)
-            self.scale_divider_561 = self.config.fucci_transform.get("scale_divider_561", 1.0)
-            self.fucci_scaler = np.array([self.scale_divider_488, self.scale_divider_561])
-            print(f"✓ Scale dividers: 488={self.scale_divider_488}, 561={self.scale_divider_561}")
-
         self.cell_ids = self.data_source.get_cell_ids()
         self.fucci_1D_projection = self.config.fucci_1D_projection
         self.projector = None
@@ -118,9 +115,7 @@ class BaseCellDataset(Dataset):
     def compute_labels(self, cell_data):
         labels = compute_fucci_labels(cell_data, mask_intensity=self.mask_intensity)
 
-        if "scale" in self.config.fucci_transform:
-            labels = labels / self.fucci_scaler
-        elif "log" in self.config.fucci_transform:
+        if self.config.fucci_transform == "log":
             # to avoid log(0) and log of negative values
             if labels[0] <= 1e-6:
                 labels[0] = 1e-6
@@ -143,6 +138,7 @@ class ModularCellDataModule(L.LightningDataModule):
         self,
         data_config_path: Optional[str] = None,
         data_config: Optional[DataSetConfig] = None,
+        hold_out_exp_id: Optional[str] = None,
     ):
         """
         Args:
@@ -162,9 +158,13 @@ class ModularCellDataModule(L.LightningDataModule):
         else:
             self.config = data_config
 
+        if hold_out_exp_id is not None:
+            self.config.hold_out_exp_id = hold_out_exp_id
+
         # Save hyperparameters for Lightning
         self.save_hyperparameters(self.config.to_dict())
 
+        self.generator = torch.Generator().manual_seed(self.config.seed)
         # Datasets (initialized in setup)
         self.train_dataset = None
         self.val_dataset = None
@@ -191,19 +191,46 @@ class ModularCellDataModule(L.LightningDataModule):
         else:
             self.full_dataset = ModularCellImageDataset(self.config)
 
-        # Split with generator for reproducibility
-        self.train_dataset, self.val_dataset, self.test_dataset = split_dataset(
-            self.full_dataset, self.config.data_split, self.config.seed
-        )
-        self.train_dataset = torch.utils.data.Subset(
-            deepcopy(self.full_dataset), self.train_dataset.indices
-        )
-        self.val_dataset = torch.utils.data.Subset(
-            deepcopy(self.full_dataset), self.val_dataset.indices
-        )
-        self.test_dataset = torch.utils.data.Subset(
-            deepcopy(self.full_dataset), self.test_dataset.indices
-        )
+        if self.config.hold_out_exp_id is not None:
+            self.test_dataset = deepcopy(self.full_dataset)
+            exp_id_filtered_config = deepcopy(self.config)
+            exp_id_filtered_config.data_source.quality_filters.allowed_exp_ids = (
+                self.config.hold_out_exp_id
+            )
+            exp_id_filtered_datasource = create_data_source_from_config(
+                exp_id_filtered_config.data_source
+            )
+
+            exp_id_cell_ids = np.array(exp_id_filtered_datasource.get_cell_ids())
+            all_cell_ids = np.array(self.full_dataset.data_source.get_cell_ids())
+
+            indices_hold_out = np.where(~np.isin(all_cell_ids, exp_id_cell_ids))[0]
+            indices_contained = np.where(np.isin(all_cell_ids, exp_id_cell_ids))[0]
+
+            train_indices, val_indices = random_split(
+                range(len(indices_hold_out)),
+                self.config.data_split,
+                self.generator,
+            )
+            train_indices = indices_hold_out[list(train_indices.indices)]
+            val_indices = indices_hold_out[list(val_indices.indices)]
+            test_indices = indices_contained
+
+            print(f"✓ Holding out exp_id '{self.config.hold_out_exp_id}' for testing")
+            print(f"   ✓ Train/Val: {len(train_indices) + len(val_indices):,} samples")
+            print(f"   ✓ Test:      {len(test_indices):,} samples")
+        else:
+            # Split with generator for reproducibility
+            self.train_dataset, self.val_dataset, self.test_dataset = split_dataset(
+                self.full_dataset, self.config.data_split, self.config.seed
+            )
+            train_indices = self.train_dataset.indices
+            val_indices = self.val_dataset.indices
+            test_indices = self.test_dataset.indices
+
+        self.train_dataset = torch.utils.data.Subset(deepcopy(self.full_dataset), train_indices)
+        self.val_dataset = torch.utils.data.Subset(deepcopy(self.full_dataset), val_indices)
+        self.test_dataset = torch.utils.data.Subset(deepcopy(self.full_dataset), test_indices)
 
         print(f"   ✓ Train: {len(self.train_dataset):,} samples")
         print(f"   ✓ Val:   {len(self.val_dataset):,} samples")
@@ -214,6 +241,9 @@ class ModularCellDataModule(L.LightningDataModule):
         self.val_dataset.dataset.apply_augmentation = False
         self.test_dataset.dataset.apply_augmentation = False
 
+        assert set(self.train_dataset.indices).isdisjoint(set(self.val_dataset.indices))
+        assert set(self.train_dataset.indices).isdisjoint(set(self.test_dataset.indices))
+        assert set(self.val_dataset.indices).isdisjoint(set(self.test_dataset.indices))
         print("✓ Augmentation applied to training dataset")
 
         print("\n" + "=" * 60)
@@ -228,6 +258,7 @@ class ModularCellDataModule(L.LightningDataModule):
             shuffle=True,
             num_workers=self.config.num_workers,
             pin_memory=True if self.config.num_workers > 0 else False,
+            persistent_workers=True if self.config.num_workers > 0 else False,
         )
 
     def val_dataloader(self) -> DataLoader:
@@ -266,7 +297,7 @@ class ModularCellImageDataset(BaseCellDataset):
     Generic cell image dataset that works with any DataSource and Transform pipeline.
     """
 
-    def __init__(self, data_config: DataSetConfig):
+    def __init__(self, data_config: DataSetConfig, use_memory_cache: bool = False):
         if isinstance(data_config, dict):
             data_config = DataSetConfig(**data_config)
 
@@ -275,9 +306,15 @@ class ModularCellImageDataset(BaseCellDataset):
         self.apply_augmentation = False
         super().__init__(data_config=data_config)
         # Build an optional torchvision-based augmentation pipeline from config
+        # self.augmentation_transform = self.create_albumentations_transform() #self.create_augmentation_transform()
         self.augmentation_transform = self.create_augmentation_transform()
+        self.use_memory_cache = use_memory_cache
+        if self.use_memory_cache:
+            self.memory_cache_list = [None] * len(self.cell_ids)
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        if self.use_memory_cache and self.memory_cache_list[idx] is not None:
+            return self.memory_cache_list[idx]
         cell_data, labels = self.get_cell_data_fucci_labels(idx)
         channel_list = []
         for channel_name in self.input_channels:
@@ -300,16 +337,114 @@ class ModularCellImageDataset(BaseCellDataset):
         images = images.astype(np.float32)
         if images.ndim == 2:
             images = images[np.newaxis, :]
+
         images_tensor = torch.from_numpy(images)
+        labels_tensor = torch.from_numpy(labels).float()
+
+        if self.use_memory_cache:
+            self.memory_cache_list[idx] = (images_tensor, labels_tensor)
+
         # Apply augmentation only when enabled for this split and a transform exists
         if self.apply_augmentation and self.augmentation_transform is not None:
             try:
+                # images_tensor = self._apply_augmentation(images_tensor) #self.augmentation_transform(image=images_tensor)
                 images_tensor = self.augmentation_transform(images_tensor)
             except Exception as e:
                 # Fail soft: don't break data loading if aug fails for an edge case
                 print(f"\u26a0 Augmentation failed for index {idx}: {e}")
-        labels_tensor = torch.from_numpy(labels).float()
+
         return images_tensor, labels_tensor
+
+    def _apply_augmentation(self, images_tensor: torch.Tensor) -> torch.Tensor:
+        """Apply augmentation using Albumentations or torchvision."""
+        try:
+            if isinstance(self.augmentation_transform, A.Compose):
+                # Albumentations expects HWC numpy array
+                # Our tensor is CHW, so we need to transpose
+                images_np = images_tensor.numpy()
+
+                # For multi-channel: transpose to HWC
+                if images_np.ndim == 3:
+                    images_np = np.transpose(images_np, (1, 2, 0))  # CHW -> HWC
+
+                # Apply augmentation
+                augmented = self.augmentation_transform(image=images_np)
+                images_np = augmented["image"]
+
+                # Transpose back to CHW
+                if images_np.ndim == 3:
+                    images_np = np.transpose(images_np, (2, 0, 1))  # HWC -> CHW
+
+                return torch.from_numpy(images_np.copy())
+            else:
+                # Torchvision transform
+                return self.augmentation_transform(images_tensor)
+        except Exception as e:
+            print(f"⚠ Augmentation failed: {e}")
+            return images_tensor
+
+    def create_albumentations_transform(self):
+        """Create fast Albumentations augmentation pipeline."""
+        aug_dict = self.config.augmentations
+        if aug_dict is None:
+            return None
+
+        transforms_list = []
+
+        for name, params in aug_dict.items():
+            params = params if params else {}
+
+            if name == "RandomHorizontalFlip":
+                p = params.get("p", 0.5)
+                transforms_list.append(A.HorizontalFlip(p=p))
+
+            elif name == "RandomVerticalFlip":
+                p = params.get("p", 0.5)
+                transforms_list.append(A.VerticalFlip(p=p))
+
+            elif name == "RandomRotation":
+                degrees = params.get("degrees", 360)
+                p = params.get("p", 1.0)
+                # Albumentations uses limit as max rotation in either direction
+                if isinstance(degrees, (int, float)):
+                    limit = degrees
+                else:
+                    limit = max(abs(degrees[0]), abs(degrees[1]))
+                transforms_list.append(A.Rotate(limit=limit, p=p, border_mode=0))
+
+            elif name == "RandomAffine":
+                transforms_list.append(
+                    A.Affine(
+                        rotate=params.get("degrees", 0),
+                        translate_percent=params.get("translate"),
+                        scale=params.get("scale"),
+                        shear=params.get("shear"),
+                        p=params.get("p", 1.0),
+                    )
+                )
+
+            elif name == "GaussianBlur":
+                transforms_list.append(
+                    A.GaussianBlur(
+                        blur_limit=params.get("kernel_size", (3, 7)),
+                        sigma_limit=params.get("sigma", (0.1, 2.0)),
+                        p=params.get("p", 0.5),
+                    )
+                )
+
+            elif name == "RandomBrightnessContrast":
+                transforms_list.append(
+                    A.RandomBrightnessContrast(
+                        brightness_limit=params.get("brightness", 0.2),
+                        contrast_limit=params.get("contrast", 0.2),
+                        p=params.get("p", 0.5),
+                    )
+                )
+
+        if not transforms_list:
+            return None
+
+        return A.Compose(transforms_list)
 
     def create_augmentation_transform(self):
         """Create a torchvision.transforms pipeline from self.config."""
@@ -349,33 +484,21 @@ class ModularCellImageFeatureDataset(ModularCellImageDataset):
         if isinstance(data_config, dict):
             data_config = DataSetConfig(**data_config)
 
-        super().__init__(data_config=data_config)
-        self.feature_extractor = FeatureExtractor()
+        # feature_data_config = deepcopy(data_config)
+        # feature_data_config.image_transforms = []
         self.feature_dataset = ModularCellFeaturesDataset(data_config=data_config)
-        self.feature_transform = None
-        self.fit_feature_transform()
+        super().__init__(data_config=data_config)
+        assert (
+            self.feature_dataset.cell_ids == self.cell_ids
+        ), "Cell IDs in feature dataset do not match image dataset"
 
     def __getitem__(self, idx: int):
         images_tensor, labels_tensor = super().__getitem__(idx)
-        cell_data, labels = self.get_cell_data_fucci_labels(idx)
-        features = self.feature_extractor.extract_all_features(cell_data)
-        if self.feature_transform:
-            transformed_feature = self.feature_transform.transform(
-                pd.DataFrame(features, index=[0])
-            )
-        else:
-            transformed_feature = list(features.values())
-        features_arr = np.array(transformed_feature, dtype=np.float32)
+        features, _ = self.feature_dataset[idx]
+        features_arr = np.array(list(features.values()), dtype=np.float32)
         features_tensor = torch.from_numpy(features_arr)
 
         return (images_tensor, features_tensor), labels_tensor
-
-    def fit_feature_transform(self):
-        self.feature_transform = self.feature_dataset.feature_transform
-        self.feature_dataset.feature_transform = None
-        feature_df = self.feature_dataset.get_dataset_df()
-        feature_array = feature_df.drop(columns=["label_488", "label_561"])
-        self.feature_transform.fit(feature_array)
 
 
 class ModularCellFeaturesDataset(BaseCellDataset):
@@ -387,20 +510,44 @@ class ModularCellFeaturesDataset(BaseCellDataset):
         self,
         data_config: DataSetConfig,
         use_cache: bool = True,
+        include_exp_id=False,
     ):
         if isinstance(data_config, dict):
             data_config = DataSetConfig(**data_config)
+        else:
+            data_config = deepcopy(data_config)
 
         self.use_cache = use_cache
         self.feature_extractor = FeatureExtractor()
-        super().__init__(data_config=data_config)
-
+        data_config.image_transforms = []
+        self.features = data_config.features
+        self.polynomial = data_config.polynomial if data_config.polynomial else 1
+        self._feature_transform_fitted = False
+        self._include_exp_id = include_exp_id
         self.feature_transform = create_transform_pipeline_from_config(
             data_config.feature_transforms, transform_type="feature"
         )
-
-        self.label_names = ["label_488", "label_561"]
         self.df = None
+
+        super().__init__(data_config=data_config)
+        self.label_names = (
+            ["phase"]
+            if self.projector and self.fucci_1D_projection
+            else [
+                "intensity_488",
+                "intensity_561",
+            ]
+        )
+        self._ensure_fitted()
+
+    def _fit_transform(self):
+        if self.feature_transform:
+            df = self._load_df()
+            feature_df = df.drop(columns=self.label_names)
+            if "exp_id" in feature_df.columns:
+                feature_df = feature_df.drop(columns=["exp_id"])
+            self.feature_transform.fit(feature_df)
+        self._feature_transform_fitted = True
 
     def _get_cache_key(self) -> str:
         """Generate a cache key based on dataset configuration."""
@@ -411,8 +558,9 @@ class ModularCellFeaturesDataset(BaseCellDataset):
                 self.image_transform.get_config() if self.image_transform else None
             ),
             "label_names": self.label_names,
+            "include_exp_id": self._include_exp_id,
         }
-        cache_params.update(self.config.fucci_transform)
+        cache_params.update({"fucci_transform": self.config.fucci_transform})
         cache_hash = make_hash_from_dict(cache_params, length=12)
         return f"features_{cache_hash}"
 
@@ -448,10 +596,95 @@ class ModularCellFeaturesDataset(BaseCellDataset):
         cache_path = self._get_cache_path()
         save_parquet_cache(df, str(cache_path))
 
+    def _ensure_fitted(self):
+        if not self._feature_transform_fitted:
+            self._fit_transform()
+
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        cell_data, labels = self.get_cell_data_fucci_labels(idx)
-        features = self.feature_extractor.extract_all_features(cell_data)
+        if self.df is not None:
+            row = self.df.iloc[idx]
+            features = row.drop(labels=self.label_names).to_dict()
+            labels = row[self.label_names].to_numpy()
+        else:
+            cell_data, labels = self.get_cell_data_fucci_labels(idx)
+            features = self.feature_extractor.extract_all_features(cell_data)
+
+        if self.feature_transform and self._feature_transform_fitted:
+            transformed_features = self.feature_transform.transform(pd.DataFrame([features]))
+            features = {k: v for k, v in zip(features.keys(), transformed_features[0])}
+
+        features = polynomial_transform(features, degree=self.polynomial)
+
+        if self.features:
+            features = {k: v for k, v in features.items() if k in self.features}
+
+        if self._include_exp_id:
+            features["exp_id"] = cell_data.metadata.get("exp_id")
+
         return features, labels
+
+    def _load_df(self, force_recompute: bool = False) -> pd.DataFrame:
+        df = None
+        if self.use_cache and not force_recompute:
+            cached_df = self._load_cached_df()
+            if cached_df is not None:
+                df = cached_df
+        if df is None:
+            # Cache miss or force recompute - extract features
+            print(f"Extracting features from {len(self)} samples...")
+            self._feature_transform_fitted = False
+            self.df = None
+            results = []
+
+            def extract_single_sample(idx):
+                """Extract features for a single sample."""
+                try:
+                    features, labels = self[idx]
+                    return (features, labels, None)
+                except Exception as e:
+                    return (None, None, f"Index {idx}: {str(e)}")
+
+            # Use joblib for parallel processing with progress bar
+            results = Parallel(n_jobs=-1, verbose=0, backend="loky")(
+                delayed(extract_single_sample)(idx)
+                for idx in tqdm(range(len(self)), desc="Extracting features")
+            )
+            features_list = []
+            labels_list = []
+            errors = []
+
+            for features, labels, error in results:
+                if error is None:
+                    features_list.append(features)
+                    labels_list.append(labels)
+                else:
+                    errors.append(error)
+            if errors:
+                print(f"\nWarning: Failed to extract features for {len(errors)} samples:")
+                for error in errors[:10]:  # Show first 10 errors
+                    print(f"  - {error}")
+                if len(errors) > 10:
+                    print(f"  ... and {len(errors) - 10} more errors")
+
+            # Create DataFrame
+            df = pd.DataFrame(features_list)
+            for i, label_name in enumerate(self.label_names):
+                df[label_name] = [label[i] for label in labels_list]
+
+            # Save to cache
+            self._save_cached_df(df)
+
+        df = polynomial_transform(df, degree=self.polynomial)
+
+        # Ensure all numeric columns are float type
+        for col in df.columns:
+            if col not in ["exp_id"]:  # Skip non-numeric identifier columns
+                try:
+                    df[col] = df[col].astype(float)
+                except Exception as e:
+                    print(f"Warning: Could not convert column '{col}' to float: {e}")
+        self.df = df
+        return df
 
     def get_dataset_df(self, force_recompute: bool = False) -> pd.DataFrame:
         """Get dataset as a Pandas DataFrame with caching support.
@@ -462,53 +695,24 @@ class ModularCellFeaturesDataset(BaseCellDataset):
         Returns:
             DataFrame with features and labels
         """
-        df = None
-        # Try to load from cache first
-        if not force_recompute:
-            cached_df = self._load_cached_df()
-            if cached_df is not None:
-                df = cached_df
-        if df is None:
-            # Cache miss or force recompute - extract features
-            print(f"Extracting features from {len(self)} samples...")
-            features_list = []
-            labels_list = []
-            for idx in tqdm(range(len(self)), desc="Extracting features"):
-                try:
-                    features, labels = self[idx]
-                    features_list.append(features)
-                    labels_list.append(labels)
-                except Exception as e:
-                    print(f"Warning: Failed to extract features for sample {idx}: {e}")
-                    traceback.print_exc()
-                    continue
 
-            # Create DataFrame
-            df = pd.DataFrame(features_list)
-            for i, label_name in enumerate(self.label_names):
-                df[label_name] = [label[i] for label in labels_list]
-
-            # Save to cache
-            self._save_cached_df(df)
-        # # Remove outliers based on label_488 and label_561
-        # for label in ["label_488", "label_561"]:
-        #     q_low = df[label].quantile(0.01)
-        #     q_high = df[label].quantile(0.99)
-        #     df = df[(df[label] >= q_low) & (df[label] <= q_high)]
-        #     print(f"Removed outliers in {label}: kept {len(df)} samples")
+        df = self._load_df(force_recompute)
 
         if self.feature_transform:
+            self._ensure_fitted()
             feature_df = df.drop(columns=self.label_names)
-            print("Applying feature transformations...")
-            self.feature_transform.fit(feature_df)
+            if "exp_id" in df.columns:
+                feature_df = feature_df.drop(columns=["exp_id"])
             feature_array = self.feature_transform.transform(feature_df)
             transformed_feature_df = pd.DataFrame(feature_array, columns=feature_df.columns)
             for i, label_name in enumerate(self.label_names):
                 transformed_feature_df[label_name] = df[label_name].values
+            if "exp_id" in df.columns:
+                transformed_feature_df["exp_id"] = df["exp_id"]
+
             df = transformed_feature_df
 
-        self.df = df
-        return self.df
+        return df
 
     def split_X_y(self, dataset_df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
         """
@@ -554,7 +758,6 @@ def split_dataset(
 def compute_fucci_labels(
     cell_data: CellData,
     mask_intensity: str = "segmentation",
-    debug: bool = False,
 ) -> np.ndarray:
     """
     Compute FUCCI mean log intensities (488 and 561) from cell data within the specified mask.
@@ -588,11 +791,7 @@ def compute_fucci_labels(
             mean_outside_mask = plane[mask == 0].mean()
             plane_normalized = plane - mean_outside_mask  # Background subtraction
             plane_normalized = np.clip(plane_normalized, 0, None)  # Remove negatives
-            if debug:
-                show_images(
-                    [plane, mask, plane_normalized],
-                    titles=[f"{channel} plane", "Mask", "Normalized"],
-                )
+
             masked_values = plane_normalized[mask > 0]
             mean_intensity = None
             if len(masked_values) > 0:
@@ -614,17 +813,3 @@ def compute_fucci_labels(
             raise ValueError(f"Channel {channel} not found in cell data")
 
     return np.array(labels, dtype=np.float32)
-
-
-def show_images(images: List[np.ndarray], titles: Optional[List[str]] = None):
-    import matplotlib.pyplot as plt
-
-    n = len(images)
-    fig, axes = plt.subplots(1, n, figsize=(15, 5))
-    if n == 1:
-        axes = [axes]
-    for ax, img, title in zip(axes, images, titles or []):
-        ax.imshow(img, cmap="gray")
-        ax.set_title(title)
-        ax.axis("off")
-    plt.show()
