@@ -4,10 +4,13 @@ This module provides tools for extracting morphological and intensity features
 from cell images and segmentation masks.
 """
 
+import pandas as pd
+import mahotas
 import numpy as np
 import traceback
-from typing import Dict
+from typing import Dict, Union, Optional, List
 from skimage.measure import label, regionprops
+import re
 
 
 class FeatureExtractor:
@@ -38,6 +41,7 @@ class FeatureExtractor:
             raise ValueError(f"No regions found in mask for cell {cell_name}.")
 
         prop = properties[0]
+        roundness = (4 * np.pi * prop.area) / (prop.perimeter**2) if prop.perimeter > 0 else 0
         return {
             f"{type}_area": prop.area,
             f"{type}_perimeter": prop.perimeter,
@@ -47,6 +51,7 @@ class FeatureExtractor:
             f"{type}_extent": prop.extent,
             f"{type}_major_axis_length": prop.major_axis_length,
             f"{type}_minor_axis_length": prop.minor_axis_length,
+            f"{type}_roundness": roundness,
         }
 
     def extract_intensity_features(
@@ -71,6 +76,51 @@ class FeatureExtractor:
 
         return features
 
+    def extract_texture_features(self, image: np.ndarray, mask: np.ndarray, type: str) -> Dict:
+        """Extract texture features from the image within the mask."""
+        props = regionprops(mask)
+
+        # a. Extract the bounding box of the specific cell (Crop)
+        # Coordinates from regionprops are (min_row, min_col, max_row, max_col)
+        minr, minc, maxr, maxc = props[0].bbox
+
+        cell_crop = image[minr:maxr, minc:maxc]
+        mask_crop = mask[minr:maxr, minc:maxc]
+
+        # Mask the crop so we only analyze the cell/nucleus, not the background in the box
+        cell_isolated = np.where(mask_crop == 0, cell_crop, 0)
+
+        # Rescale intensity for Haralick
+        # Haralick requires integer inputs and a small range (e.g., 0-255 or 0-63).
+        # If we use raw 16-bit (0-65535), the GLCM matrix is huge and computation fails.
+        # Here we convert to 8-bit (0-255).
+        if cell_isolated.max() > 0:
+            scale_factor = 255 / cell_isolated.max()
+            cell_8bit = (cell_isolated * scale_factor).astype(np.uint8)
+        else:
+            cell_8bit = cell_isolated.astype(np.uint8)
+        texture_feats = mahotas.features.haralick(cell_8bit)
+        mean_texture = texture_feats.mean(axis=0)
+
+        # Append specific features we care about:
+        # Index 1 = Contrast (Edges/Mitosis)
+        # Index 8 = Entropy (Disorder)
+        return {
+            f"haralick_contrast_{type}": mean_texture[1],
+            f"haralick_entropy_{type}": mean_texture[8],
+            f"haralick_correlation_{type}": mean_texture[2],
+        }
+
+    def polynomial_transform(self, features: dict):
+        """Apply polynomial transformations to selected features"""
+        transformed_features = {}
+        for key, value in features.items():
+            if isinstance(value, (int, float)):
+                transformed_features[f"{key}^2"] = value**2
+                transformed_features[f"{key}^3"] = value**3
+
+        return transformed_features
+
     def extract_all_features(self, cell_data) -> Dict:
         """Extract all features for a single cell data dict.
 
@@ -93,8 +143,17 @@ class FeatureExtractor:
                 nucleus_image, nuclei_seg_mask, cell_name, type="nucleus"
             )
 
+            texture_features_cell = self.extract_texture_features(
+                nucleus_image, seg_mask, type="cell"
+            )
+            texture_features_nucleus = self.extract_texture_features(
+                nucleus_image, nuclei_seg_mask, type="nucleus"
+            )
+
             features.update(morphological_features_cell)
             features.update(morphological_features_nucleus)
+            features.update(texture_features_cell)
+            features.update(texture_features_nucleus)
 
             features["cell_nucleus_area_ratio"] = (
                 morphological_features_nucleus["nucleus_area"]
@@ -109,8 +168,36 @@ class FeatureExtractor:
             )
             features.update(intensity_features)
 
+            polynomial_features = self.polynomial_transform(features)
+            features.update(polynomial_features)
         except Exception:
             print(f"Error extracting features for {cell_name}:")
             traceback.print_exc()
 
         return features
+
+
+def polynomial_transform(
+    features: Union[dict, pd.DataFrame, pd.Series], columns: Optional[List] = None, degree: int = 3
+):
+    if columns is None:
+        if isinstance(features, dict):
+            columns = list(features.keys())
+        elif isinstance(features, (pd.DataFrame, pd.Series)):
+            columns = features.columns
+        else:
+            raise TypeError(
+                "Unsupported type for features. Expected dict, pd.DataFrame, or pd.Series."
+            )
+
+    for column in columns:
+        if re.search(r"\^\d+$", column):
+            if int(column.split("^")[-1]) > degree:
+                del features[column]
+            continue
+        for d in range(2, degree + 1):
+            poly_column = str(column) + "^" + str(d)
+            try:
+                features[poly_column] = features[column] ** d
+            except:
+                pass

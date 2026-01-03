@@ -23,6 +23,8 @@ from .data_filters import (
     EmptySegmentationFilter,
     MultipleObjectsFilter,
     CellNucleiOverlappingFilter,
+    ExpIDFilter,
+    CellDuplicateFilter,
 )
 
 
@@ -35,6 +37,10 @@ class FilterConfig:
     min_seg_pixels: int = 10
     max_nuclei_outside_ratio: float = 1.2
     force_refilter: bool = False
+    allowed_exp_ids: Optional[List[str]] = None
+    excluded_exp_ids: Optional[List[str]] = None
+    filter_cell_duplicates: bool = True  # Filter out known duplicate cells by default
+    filter_duplicates: bool = True  # Filter out known duplicate cells by default
 
 
 @dataclass
@@ -411,6 +417,24 @@ def create_data_source_from_config(config: Dict) -> DataSource:
         if max_nuclei_outside_ratio
         else []
     )
+    # Add experiment ID filter if specified
+    allowed_exp_ids = getattr(qualit_filters_config, "allowed_exp_ids", None)
+    excluded_exp_ids = getattr(qualit_filters_config, "excluded_exp_ids", None)
+    if allowed_exp_ids is not None or excluded_exp_ids is not None:
+        filters.append(
+            ExpIDFilter(
+                allowed_exp_ids=allowed_exp_ids,
+                excluded_exp_ids=excluded_exp_ids,
+            )
+        )
+        print(f"   - Allowed exp_ids: {allowed_exp_ids}")
+        print(f"   - Excluded exp_ids: {excluded_exp_ids}")
+
+    # Add cell duplicate filter if enabled (default: True)
+    filter_cell_duplicates = getattr(qualit_filters_config, "filter_cell_duplicates", True)
+    if filter_cell_duplicates:
+        filters.append(CellDuplicateFilter())
+        print(f"   - Filtering known duplicate cells: enabled")
 
     filtered_source = FilteredDataSource(
         data_source=data_source,

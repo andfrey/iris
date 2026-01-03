@@ -9,6 +9,308 @@ import numpy as np
 from dataclasses import dataclass
 from skimage.measure import label
 
+CELL_DUPLICATES = {
+    "10341",
+    "10440",
+    "10482",
+    "10488",
+    "10510",
+    "10568",
+    "10628",
+    "10642",
+    "10650",
+    "10658",
+    "10678",
+    "10770",
+    "10787",
+    "10816",
+    "10847",
+    "10893",
+    "10990",
+    "11006",
+    "11012",
+    "11024",
+    "11041",
+    "11048",
+    "11052",
+    "11073",
+    "11094",
+    "12118",
+    "12227",
+    "12275",
+    "12284",
+    "12286",
+    "12305",
+    "12317",
+    "12331",
+    "12335",
+    "12337",
+    "12358",
+    "12370",
+    "12408",
+    "12414",
+    "12465",
+    "12467",
+    "12473",
+    "12475",
+    "12477",
+    "12491",
+    "12499",
+    "12537",
+    "12574",
+    "12591",
+    "12603",
+    "12619",
+    "5280",
+    "5357",
+    "5782",
+    "5842",
+    "6025",
+    "6605",
+    "6842",
+    "6902",
+    "6984",
+    "6986",
+    "6988",
+    "7000",
+    "7004",
+    "7006",
+    "7012",
+    "7019",
+    "7021",
+    "7022",
+    "7038",
+    "7040",
+    "7042",
+    "7044",
+    "7046",
+    "7048",
+    "7052",
+    "7054",
+    "7060",
+    "7062",
+    "7064",
+    "7066",
+    "7068",
+    "7070",
+    "7075",
+    "7080",
+    "7084",
+    "7086",
+    "7088",
+    "7096",
+    "7098",
+    "7106",
+    "7110",
+    "7120",
+    "7124",
+    "7126",
+    "7130",
+    "7132",
+    "7141",
+    "7145",
+    "7147",
+    "7149",
+    "7151",
+    "7153",
+    "7163",
+    "7170",
+    "7172",
+    "7174",
+    "7181",
+    "7195",
+    "7205",
+    "7213",
+    "7215",
+    "7221",
+    "7225",
+    "7229",
+    "7231",
+    "7235",
+    "7245",
+    "7251",
+    "7260",
+    "7262",
+    "7280",
+    "7282",
+    "7287",
+    "7289",
+    "7291",
+    "7293",
+    "7299",
+    "7301",
+    "7305",
+    "7316",
+    "7318",
+    "7320",
+    "7324",
+    "7338",
+    "7340",
+    "7346",
+    "7348",
+    "7352",
+    "7356",
+    "7366",
+    "7370",
+    "7372",
+    "7374",
+    "7961",
+    "7963",
+    "7969",
+    "7991",
+    "7997",
+    "7999",
+    "8001",
+    "8013",
+    "8020",
+    "8030",
+    "8055",
+    "8061",
+    "8069",
+    "8083",
+    "8088",
+    "8092",
+    "8102",
+    "8139",
+    "8143",
+    "8147",
+    "8155",
+    "8159",
+    "8161",
+    "8178",
+    "8180",
+    "8182",
+    "8190",
+    "8194",
+    "8200",
+    "8207",
+    "8209",
+    "8211",
+    "8217",
+    "8223",
+    "8225",
+    "8233",
+    "8236",
+    "8238",
+    "8246",
+    "8252",
+    "8277",
+    "8279",
+    "8295",
+    "8297",
+    "8301",
+    "8311",
+    "8317",
+    "8776",
+    "8780",
+    "8887",
+    "9139",
+    "9141",
+    "9151",
+    "9159",
+    "9185",
+    "9201",
+    "9215",
+    "9222",
+    "9260",
+    "9293",
+    "9295",
+    "9301",
+    "9307",
+    "9313",
+    "9316",
+    "9326",
+    "9328",
+    "9348",
+    "9350",
+    "9358",
+    "9368",
+    "9392",
+    "9410",
+    "9420",
+    "9430",
+    "9438",
+    "9468",
+    "9488",
+    "9506",
+    "9512",
+    "9534",
+    "9536",
+    "9546",
+    "9552",
+    "9554",
+    "9561",
+    "9563",
+    "9582",
+    "9588",
+    "9590",
+    "9598",
+    "9600",
+    "9606",
+    "9608",
+    "9621",
+    "9626",
+    "9630",
+    "9635",
+    "9637",
+    "9639",
+    "9648",
+    "9654",
+    "9656",
+    "9660",
+    "9665",
+    "9672",
+    "9682",
+    "9684",
+    "9686",
+    "9690",
+    "9700",
+    "9702",
+    "9708",
+    "9712",
+    "9724",
+    "9725",
+    "9729",
+    "9731",
+    "9733",
+    "9739",
+    "9743",
+    "9745",
+    "9747",
+    "9759",
+    "9767",
+    "9771",
+    "9775",
+    "9777",
+    "9783",
+    "9790",
+    "9794",
+    "9798",
+    "9800",
+    "9802",
+    "9804",
+    "9806",
+    "9808",
+    "9810",
+    "9815",
+    "9820",
+    "9826",
+    "9831",
+    "9835",
+    "9849",
+    "9851",
+    "9857",
+    "9861",
+    "9867",
+    "9875",
+    "9878",
+    "9886",
+    "9889",
+    "9891",
+    "9897",
+    "9899",
+}
+
 
 @dataclass
 class FilterResult:
@@ -231,6 +533,139 @@ class CellNucleiOverlappingFilter(CellFilter):
 
     def get_name(self) -> str:
         return f"NucleCellNucleiOverlappingFilteriSize(max_ratio={self.max_ratio}, max_ratio_nuclei={self.max_ratio_nuclei})"
+
+
+class ExpIDFilter(CellFilter):
+    """Filter cells based on experiment ID."""
+
+    # Experiment IDs that should always be excluded
+    DEFAULT_EXCLUDED_EXP_IDS = ["NG012"]
+
+    def __init__(
+        self,
+        allowed_exp_ids: Optional[List[str]] = None,
+        excluded_exp_ids: Optional[List[str]] = None,
+    ):
+        """
+        Args:
+            allowed_exp_ids: If provided, only cells from these experiments are allowed.
+            excluded_exp_ids: If provided, cells from these experiments are excluded.
+                              Note: NG012 is always excluded by default.
+        """
+        self.allowed_exp_ids = allowed_exp_ids
+        # Always include default excluded exp_ids
+        excluded = set(self.DEFAULT_EXCLUDED_EXP_IDS)
+        if excluded_exp_ids:
+            excluded.update(excluded_exp_ids)
+        self.excluded_exp_ids = list(excluded)
+
+    def __call__(self, cell_data) -> FilterResult:
+        exp_id = cell_data.metadata.get("exp_id")
+
+        if exp_id is None:
+            return FilterResult(
+                is_valid=False,
+                reason="missing_exp_id",
+                metadata={"cell_id": cell_data.metadata.get("cell_id")},
+            )
+
+        # Check if excluded
+        if exp_id in self.excluded_exp_ids:
+            return FilterResult(
+                is_valid=False,
+                reason="excluded_exp_id",
+                metadata={"exp_id": exp_id},
+            )
+
+        # Check if allowed (only if allowed_exp_ids is specified)
+        if self.allowed_exp_ids is not None and exp_id not in self.allowed_exp_ids:
+            return FilterResult(
+                is_valid=False,
+                reason="exp_id_not_allowed",
+                metadata={"exp_id": exp_id, "allowed": self.allowed_exp_ids},
+            )
+
+        return FilterResult(is_valid=True)
+
+    def get_name(self) -> str:
+        parts = []
+        if self.allowed_exp_ids:
+            parts.append(f"allowed={self.allowed_exp_ids}")
+        if self.excluded_exp_ids:
+            parts.append(f"excluded={self.excluded_exp_ids}")
+        return f"ExpIDFilter({', '.join(parts)})"
+
+
+class CellDuplicatesFilter(CellFilter):
+    """Filter cells that are known duplicates based on similarity analysis."""
+
+    def __init__(self, duplicate_cell_ids: Optional[set] = None):
+        """
+        Args:
+            duplicate_cell_ids: Set of cell IDs to filter out. If None, uses the
+                              global CELL_DUPLICATES set defined in this module.
+        """
+        self.duplicate_cell_ids = (
+            duplicate_cell_ids if duplicate_cell_ids is not None else CELL_DUPLICATES
+        )
+
+    def __call__(self, cell_data) -> FilterResult:
+        cell_id = cell_data.metadata.get("cell_id")
+
+        if cell_id is None:
+            # Can't check without cell_id, let it pass
+            return FilterResult(is_valid=True)
+
+        # Convert to string for comparison (CELL_DUPLICATES contains strings)
+        cell_id_str = str(cell_id)
+
+        if cell_id_str in self.duplicate_cell_ids:
+            return FilterResult(
+                is_valid=False,
+                reason="cell_duplicate",
+                metadata={"cell_id": cell_id_str},
+            )
+
+        return FilterResult(is_valid=True)
+
+    def get_name(self) -> str:
+        return f"CellDuplicatesFilter(n_duplicates={len(self.duplicate_cell_ids)})"
+
+
+class CellDuplicateFilter(CellFilter):
+    """Filter cells that are identified as duplicates based on similarity analysis."""
+
+    def __init__(self, duplicate_cell_ids: Optional[set] = None):
+        """
+        Args:
+            duplicate_cell_ids: Set of cell IDs to filter out. If None, uses the
+                                CELL_DUPLICATES set defined in this module.
+        """
+        self.duplicate_cell_ids = duplicate_cell_ids or CELL_DUPLICATES
+
+    def __call__(self, cell_data) -> FilterResult:
+        cell_id = cell_data.metadata.get("cell_id")
+
+        if cell_id is None:
+            return FilterResult(
+                is_valid=False,
+                reason="missing_cell_id",
+            )
+
+        # Convert to string for comparison (CELL_DUPLICATES contains strings)
+        cell_id_str = str(cell_id)
+
+        if cell_id_str in self.duplicate_cell_ids:
+            return FilterResult(
+                is_valid=False,
+                reason="cell_duplicate",
+                metadata={"cell_id": cell_id_str},
+            )
+
+        return FilterResult(is_valid=True)
+
+    def get_name(self) -> str:
+        return f"CellDuplicateFilter(n_duplicates={len(self.duplicate_cell_ids)})"
 
 
 class CompositeFilter:
