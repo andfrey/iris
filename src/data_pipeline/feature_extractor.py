@@ -167,9 +167,6 @@ class FeatureExtractor:
                 nucleus_image, nuclei_seg_mask, seg_mask
             )
             features.update(intensity_features)
-
-            polynomial_features = self.polynomial_transform(features)
-            features.update(polynomial_features)
         except Exception:
             print(f"Error extracting features for {cell_name}:")
             traceback.print_exc()
@@ -201,3 +198,4 @@ def polynomial_transform(
                 features[poly_column] = features[column] ** d
             except:
                 pass
+    return features

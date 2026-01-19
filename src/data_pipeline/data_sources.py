@@ -5,7 +5,7 @@ Each adapter provides a unified interface for reading data.
 
 import json
 from abc import ABC, abstractmethod
-from typing import Dict, List, Any, Optional, Union
+from typing import Dict, List, Any, Optional, Union, Tuple
 from pathlib import Path
 from dataclasses import dataclass, field
 import h5py
@@ -13,6 +13,8 @@ import numpy as np
 from tqdm import tqdm
 import hashlib
 import os
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import multiprocessing
 
 from .data_filters import (
     CellFilter,
@@ -35,10 +37,10 @@ class FilterConfig:
     plane_count: int = 3
     max_objects: int = 1
     min_seg_pixels: int = 10
-    max_nuclei_outside_ratio: float = 1.2
+    max_nuclei_outside_ratio: float = 0.2
     force_refilter: bool = False
     allowed_exp_ids: Optional[List[str]] = None
-    excluded_exp_ids: Optional[List[str]] = None
+    excluded_exp_ids: Optional[List[str]] = field(default_factory=lambda: ["NG012"])
     filter_cell_duplicates: bool = True  # Filter out known duplicate cells by default
     filter_duplicates: bool = True  # Filter out known duplicate cells by default
 
@@ -212,6 +214,37 @@ Filtered dataset that applies quality filters to data sources.
 """
 
 
+def _filter_cell_batch(
+    h5_path: str, cell_ids: List[str], filters: List[CellFilter]
+) -> List[Tuple[str, bool, Optional[str], Optional[Dict]]]:
+    """
+    Worker function for parallel filtering. Must be at module level for pickling.
+
+    Args:
+        h5_path: Path to HDF5 file
+        cell_ids: List of cell IDs to filter
+        filters: List of filter objects to apply
+
+    Returns:
+        List of (cell_id, is_valid, reason, metadata) tuples
+    """
+    results = []
+    composite_filter = CompositeFilter(filters)
+
+    # Create a local H5DataSource for this worker
+    data_source = H5DataSource(path=h5_path, plane_selection="all")
+
+    for cell_id in cell_ids:
+        try:
+            cell_data = data_source.load_cell(cell_id)
+            result = composite_filter(cell_data)
+            results.append((cell_id, result.is_valid, result.reason, result.metadata))
+        except Exception as e:
+            results.append((cell_id, False, "load_error", {"error": str(e)}))
+
+    return results
+
+
 class FilteredDataSource:
     """
     Wrapper around DataSource that filters cells based on quality criteria.
@@ -307,8 +340,13 @@ class FilteredDataSource:
         except Exception as e:
             print(f"⚠ Error saving cache: {e}")
 
-    def _apply_filters(self):
-        """Apply filters to all cells and cache results"""
+    def _apply_filters(self, n_workers: Optional[int] = None):
+        """Apply filters to all cells and cache results.
+
+        Args:
+            n_workers: Number of parallel workers. If None, uses cpu_count - 1.
+                      Set to 0 or 1 for sequential processing.
+        """
         if self._valid_cell_ids is not None:
             return  # Already filtered
 
@@ -321,23 +359,64 @@ class FilteredDataSource:
 
         self._filter_stats = FilterStatistics()
 
-        for cell_id in tqdm(all_cell_ids, desc="Filtering cells"):
-            try:
-                cell_data = self.data_source.load_cell(cell_id)
-                result = self.composite_filter(cell_data)
-                self._filter_stats.record_result(cell_id, result)
-            except Exception as e:
-                # Record as invalid due to load error
-                self._filter_stats.record_result(
-                    cell_id,
-                    FilterResult(is_valid=False, reason="load_error", metadata={"error": str(e)}),
-                )
+        # Determine number of workers
+        if n_workers is None:
+            n_workers = max(1, multiprocessing.cpu_count() - 1)
+
+        # Use sequential processing if n_workers <= 1 or small dataset
+        if n_workers <= 1 or len(all_cell_ids) < 100:
+            self._apply_filters_sequential(all_cell_ids)
+        else:
+            self._apply_filters_parallel(all_cell_ids, n_workers)
 
         self._valid_cell_ids = self._filter_stats.valid_cell_ids
         self._filter_stats.print_summary()
 
         # Save to cache
         self._save_to_cache()
+
+    def _apply_filters_sequential(self, all_cell_ids: List[str]):
+        """Apply filters sequentially (original implementation)."""
+        for cell_id in tqdm(all_cell_ids, desc="Filtering cells"):
+            try:
+                cell_data = self.data_source.load_cell(cell_id)
+                result = self.composite_filter(cell_data)
+                self._filter_stats.record_result(cell_id, result)
+            except Exception as e:
+                self._filter_stats.record_result(
+                    cell_id,
+                    FilterResult(is_valid=False, reason="load_error", metadata={"error": str(e)}),
+                )
+
+    def _apply_filters_parallel(self, all_cell_ids: List[str], n_workers: int):
+        """Apply filters in parallel using multiple processes."""
+        print(f"Using {n_workers} parallel workers")
+
+        # Get data source path and filter config for workers
+        h5_path = str(self.data_source.path)
+        filters = self.composite_filter.filters
+
+        # Process in batches to show progress
+        batch_size = max(100, len(all_cell_ids) // (n_workers * 10))
+        batches = [
+            all_cell_ids[i : i + batch_size] for i in range(0, len(all_cell_ids), batch_size)
+        ]
+
+        with ProcessPoolExecutor(max_workers=n_workers) as executor:
+            futures = {
+                executor.submit(_filter_cell_batch, h5_path, batch, filters): batch
+                for batch in batches
+            }
+
+            with tqdm(total=len(all_cell_ids), desc="Filtering cells") as pbar:
+                for future in as_completed(futures):
+                    batch_results = future.result()
+                    for cell_id, is_valid, reason, metadata in batch_results:
+                        self._filter_stats.record_result(
+                            cell_id,
+                            FilterResult(is_valid=is_valid, reason=reason, metadata=metadata),
+                        )
+                    pbar.update(len(batch_results))
 
     def get_cell_ids(self) -> List[str]:
         """Get list of valid cell IDs (after filtering)"""

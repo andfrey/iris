@@ -19,8 +19,7 @@
 
   add_features: true
 
-  fucci_transform:
-    log: {}
+  fucci_transform: log
   # Preprocessing transforms
   image_transforms:
     - class_path: src.data_pipeline.data_transforms.NormalizeTransform

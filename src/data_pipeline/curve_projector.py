@@ -197,12 +197,20 @@ class FucciCurveProjector:
         self,
         use_cache: bool = True,
         cache_key_extra: Optional[Dict[str, Any]] = None,
+        n_workers: int = -1,
     ) -> "FucciCurveProjector":
         """Fit the reference curve directly from a dataset with two-level caching.
 
         Cache extracted (N,2) intensity points from the dataset
 
         This avoids re-iterating the dataset if only curve parameters change
+
+        Args:
+            use_cache: Whether to use caching for extracted points
+            cache_key_extra: Additional key-value pairs for cache key
+            n_workers: Number of parallel workers for extraction.
+                      -1 uses all available cores (default).
+                      1 disables parallelism for sequential processing.
         """
         # Resolve cache directory
         cdir = self.default_cache_dir or Path(".cache")
@@ -226,7 +234,7 @@ class FucciCurveProjector:
             P = data["points"]
         else:
             print("⟳ Extracting FUCCI intensity points from dataset…")
-            P = self._extract_points_from_dataset(self.dataset)
+            P = self._extract_points_from_dataset(self.dataset, n_workers=n_workers)
             if use_cache:
                 np.savez_compressed(pts_cache_path, points=P)
 
@@ -686,27 +694,84 @@ class FucciCurveProjector:
         elif self.shape == "polygon" and self.polygon_lines is None:
             self.fit_from_dataset()
 
-    def _extract_points_from_dataset(self, dataset: Any) -> np.ndarray:
-        """Try several strategies to obtain (N,2) points from a dataset.
+    def _extract_points_from_dataset(self, dataset: Any, n_workers: int = -1) -> np.ndarray:
+        """Extract (N,2) intensity points from a dataset using joblib for parallelism.
 
         Iterate and collect labels assuming each sample yields (..., labels)
-        """
 
-        # Iterable dataset returning labels at index 1 or last position
-        pts_list = []
-        for sample in tqdm(dataset, desc="Extracting FUCCI intensities from dataset"):
-            # allow ((x, feat), y) or (x, y)
-            if isinstance(sample, tuple):
-                labels = sample[-1]
-            else:
-                raise ValueError(
-                    "Each dataset item must be a tuple ending with labels of shape (2,)"
-                )
-            arr = np.asarray(labels, dtype=float).reshape(-1)
-            if arr.shape[0] != 2:
-                raise ValueError(f"Expected label shape (2,) for (488,561), got {arr.shape}")
-            pts_list.append(arr)
-        return np.stack(pts_list, axis=0)
+        Args:
+            dataset: Iterable dataset where each item is a tuple ending with labels
+            n_workers: Number of parallel workers for joblib.
+                      -1 uses all available cores (default).
+                      1 disables parallelism for sequential processing.
+        """
+        from joblib import Parallel, delayed
+
+        def extract_single_sample(idx):
+            """Extract label from a single sample by index."""
+            try:
+                sample = dataset[idx]
+                if isinstance(sample, tuple):
+                    labels = sample[-1]
+                else:
+                    raise ValueError(
+                        "Each dataset item must be a tuple ending with labels of shape (2,)"
+                    )
+                arr = np.asarray(labels, dtype=float).reshape(-1)
+                if arr.shape[0] != 2:
+                    raise ValueError(f"Expected label shape (2,) for (488,561), got {arr.shape}")
+                return (arr, None)
+            except Exception as e:
+                return (None, f"Index {idx}: {str(e)}")
+
+        # Check if dataset supports indexing
+        has_len = hasattr(dataset, "__len__")
+        has_getitem = hasattr(dataset, "__getitem__")
+
+        if has_len and has_getitem:
+            n_samples = len(dataset)
+
+            # Use joblib for parallel processing with progress bar
+            results = Parallel(n_jobs=n_workers, verbose=0, backend="loky")(
+                delayed(extract_single_sample)(idx)
+                for idx in tqdm(range(n_samples), desc="Extracting FUCCI intensities")
+            )
+
+            pts_list = []
+            errors = []
+
+            for arr, error in results:
+                if error is None:
+                    pts_list.append(arr)
+                else:
+                    errors.append(error)
+
+            if errors:
+                print(f"\nWarning: Failed to extract intensities for {len(errors)} samples:")
+                for error in errors[:10]:  # Show first 10 errors
+                    print(f"  - {error}")
+                if len(errors) > 10:
+                    print(f"  ... and {len(errors) - 10} more errors")
+
+            return np.stack(pts_list, axis=0)
+        else:
+            # Fallback for datasets without indexing support
+            def extract_label(sample):
+                if isinstance(sample, tuple):
+                    labels = sample[-1]
+                else:
+                    raise ValueError(
+                        "Each dataset item must be a tuple ending with labels of shape (2,)"
+                    )
+                arr = np.asarray(labels, dtype=float).reshape(-1)
+                if arr.shape[0] != 2:
+                    raise ValueError(f"Expected label shape (2,) for (488,561), got {arr.shape}")
+                return arr
+
+            pts_list = []
+            for sample in tqdm(dataset, desc="Extracting FUCCI intensities from dataset"):
+                pts_list.append(extract_label(sample))
+            return np.stack(pts_list, axis=0)
 
 
 def _as_points(points_like, feature_cols: Tuple[str, str]) -> np.ndarray:
