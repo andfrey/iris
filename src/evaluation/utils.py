@@ -55,8 +55,9 @@ def load_model_from_checkpoint(
 def _get_dataloader(
     data_config: dict,
     split: str = "val",
+    workers: int = 0,
 ) -> torch.utils.data.DataLoader:
-    data_config.update({"num_workers": 0})
+    data_config.update({"num_workers": workers})
     dm = ModularCellDataModule(data_config_path=None, data_config=data_config)
     dm.prepare_data()
     dm.setup()
@@ -73,6 +74,7 @@ def _get_dataloader(
 def maybe_build_dataloader_from_ckpt(
     ckpt_path: str,
     split: str = "val",
+    workers: int = 0,
 ) -> Optional[torch.utils.data.DataLoader]:
     """
     Try to reconstruct dataloaders using information stored in a Lightning checkpoint.
@@ -90,17 +92,18 @@ def maybe_build_dataloader_from_ckpt(
     # Case 1: direct path saved
     data_cfg = ckpt.get("datamodule_hyper_parameters")
 
-    return _get_dataloader(data_config=data_cfg, split=split)
+    return _get_dataloader(data_config=data_cfg, split=split, workers=workers)
 
 
 def load_ckpt_artifacts(
-    ckpt_path: str, split: str = "val", device: Optional[str] = None
+    ckpt_path: str, split: str = "val", device: Optional[str] = None, workers: int = 0
 ) -> Tuple[nn.Module, torch.utils.data.DataLoader, FucciCurveProjector]:
     """
     Load data and model config artifacts from checkpoint if available.
 
     Args:
         ckpt_path: Path to model checkpoint
+        workers: Number of workers for data loading
     """
 
     print(f"Loading checkpoint from: {ckpt_path}")
@@ -109,7 +112,7 @@ def load_ckpt_artifacts(
     model = load_model_from_checkpoint(ckpt_path)
     model.eval().to(device)
 
-    loader = maybe_build_dataloader_from_ckpt(ckpt_path, split)
+    loader = maybe_build_dataloader_from_ckpt(ckpt_path, split, workers=workers)
     if loader is None:
         print("Failed to create dataloader from checkpoint.")
         return

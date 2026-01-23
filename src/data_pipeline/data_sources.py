@@ -41,7 +41,7 @@ class FilterConfig:
     force_refilter: bool = False
     allowed_exp_ids: Optional[List[str]] = None
     excluded_exp_ids: Optional[List[str]] = field(default_factory=lambda: ["NG012"])
-    filter_cell_duplicates: bool = True  # Filter out known duplicate cells by default
+    duplicate_cell_ids: Optional[List[str]] = None  # Filter out known duplicate cells by default
     filter_duplicates: bool = True  # Filter out known duplicate cells by default
 
 
@@ -54,7 +54,7 @@ class DataSourceConfig:
 
     def __post_init__(self):
         # Ensure h5_path is a string
-        self.quality_filers = (
+        self.quality_filters = (
             FilterConfig(**self.quality_filters)
             if isinstance(self.quality_filters, dict)
             else self.quality_filters

@@ -604,9 +604,11 @@ class ModularCellFeaturesDataset(BaseCellDataset):
         if self.df is not None:
             row = self.df.iloc[idx]
             features = row.drop(labels=self.label_names).to_dict()
+            exp_id = features.pop("exp_id", None)  # Remove exp_id from features if present
             labels = row[self.label_names].to_numpy()
         else:
             cell_data, labels = self.get_cell_data_fucci_labels(idx)
+            exp_id = cell_data.metadata.get("exp_id")
             features = self.feature_extractor.extract_all_features(cell_data)
 
         if self.feature_transform and self._feature_transform_fitted:
@@ -619,7 +621,7 @@ class ModularCellFeaturesDataset(BaseCellDataset):
             features = {k: v for k, v in features.items() if k in self.features}
 
         if self._include_exp_id:
-            features["exp_id"] = cell_data.metadata.get("exp_id")
+            features["exp_id"] = exp_id
 
         return features, labels
 
@@ -674,7 +676,9 @@ class ModularCellFeaturesDataset(BaseCellDataset):
             # Save to cache
             self._save_cached_df(df)
 
-        df = polynomial_transform(df, degree=self.polynomial)
+        df = polynomial_transform(
+            df, columns=set(df.columns) - set(self.label_names) - {"exp_id"}, degree=self.polynomial
+        )
 
         # Ensure all numeric columns are float type
         for col in df.columns:

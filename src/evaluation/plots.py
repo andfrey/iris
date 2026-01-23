@@ -17,8 +17,9 @@ class PlotConfig:
 
     figsize: tuple = (10, 8)
     dpi: int = 100
-    title_fontsize: int = 14
-    label_fontsize: int = 12
+    title_fontsize: int = 22
+    label_fontsize: int = 20
+    tick_fontsize: int = 18
     alpha: float = 0.6
 
 
@@ -114,7 +115,7 @@ class PlotGenerator:
             plt.tight_layout()
 
         else:
-            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6), dpi=self.config.dpi)
+            fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(24, 10), dpi=self.config.dpi)
             # 1D scatter
             if y_true.ndim > 1:
                 y_true = y_true.flatten()
@@ -135,14 +136,23 @@ class PlotGenerator:
                 lw=2,
                 label="Perfect prediction",
             )
-            plt.colorbar(scatter, label="Geodesic Distance True vs. Predicted", ax=ax1)
+
+            cbar = plt.colorbar(scatter, ax=ax1)
+            cbar.set_label(
+                "Geodesic Distance True vs. Predicted", fontsize=self.config.label_fontsize
+            )
+            cbar.ax.tick_params(labelsize=self.config.tick_fontsize)
+
+            ax1.set_xlim(0, 1)
+            ax1.set_ylim(0, 1)
+            ax1.set_aspect("equal", adjustable="box")
             ax1.set_xlabel("True Values", fontsize=self.config.label_fontsize)
             ax1.set_ylabel("Predicted Values", fontsize=self.config.label_fontsize)
             ax1.set_title(title, fontsize=self.config.title_fontsize)
             ax1.legend()
             ax1.grid(True, alpha=0.3)
-
-            # Plot 3: Mean prediction vs true phase with std bands
+            ax1.tick_params(axis="both", labelsize=self.config.tick_fontsize)
+            ax1.legend(fontsize=self.config.label_fontsize)
 
             # Bin the true phase values
             bins = np.linspace(0, 1, n_bins + 1)
@@ -157,16 +167,13 @@ class PlotGenerator:
                 if mask.sum() > 0:
                     # For circular data, handle wrapping around 0/1
                     preds_in_bin = y_pred[mask]
+                    true_in_bin = y_true[mask]
+                    wrapped_preds = np.where(
+                        true_in_bin - preds_in_bin > 0.5, preds_in_bin + 1, preds_in_bin
+                    )
 
-                    # Use circular mean for phase data
-                    # Convert to angles, compute mean angle, convert back
-                    angles = preds_in_bin * 2 * np.pi
-                    mean_angle = np.arctan2(np.sin(angles).mean(), np.cos(angles).mean())
-                    mean_pred = (mean_angle / (2 * np.pi)) % 1.0
-
-                    # Circular standard deviation
-                    R = np.sqrt(np.sin(angles).mean() ** 2 + np.cos(angles).mean() ** 2)
-                    std_pred = np.sqrt(-2 * np.log(R)) / (2 * np.pi) if R > 0 else 0
+                    mean_pred = wrapped_preds.mean()
+                    std_pred = wrapped_preds.std()
 
                     mean_preds.append(mean_pred)
                     std_preds.append(std_pred)
@@ -231,10 +238,54 @@ class PlotGenerator:
             ax2.legend(loc="upper left")
             ax2.grid(True, alpha=0.3)
             ax2.set_xlim(0, 1)
-            ax2.set_ylim(0, 1)
+            ax2.set_aspect("equal", adjustable="box")
+            ax2.legend(loc="upper left", fontsize=self.config.label_fontsize)
+            ax2.tick_params(axis="both", labelsize=self.config.tick_fontsize)
 
             # Add diagonal reference line
             ax2.plot([0, 1], [0, 1], "k:", linewidth=1, alpha=0.5)
+
+            bins = np.linspace(0, 1, 11)
+            residuals_by_bin = []
+            bin_centers = []
+
+            for i in range(10):
+                mask = (y_true >= bins[i]) & (y_true < bins[i + 1])
+                bin_centers.append((bins[i] + bins[i + 1]) / 2)
+                residuals_by_bin.append(np.abs(np.array(residuals)[mask].squeeze()))
+
+            bin_labels = [f"{bin_centers[i]:.2f}" for i in range(10)]
+
+            # Create box plot
+            bp = ax3.boxplot(
+                residuals_by_bin,
+                positions=bin_centers,
+                widths=0.08,
+                patch_artist=True,
+                showfliers=True,
+                flierprops=dict(marker="o", markersize=3, alpha=0.3, markerfacecolor="gray"),
+            )
+
+            # Color the boxes
+            for patch in bp["boxes"]:
+                patch.set_facecolor("steelblue")
+                patch.set_alpha(0.7)
+
+            # Add median line styling
+            for median in bp["medians"]:
+                median.set_color("darkred")
+                median.set_linewidth(2)
+
+            ax3.set_xlim(0, 1)
+            ax3.set_xticks(bin_centers)
+            ax3.set_xticklabels(bin_labels)
+            ax3.set_aspect("equal", adjustable="box")
+            ax3.set_xlabel("True Phase", fontsize=self.config.label_fontsize)
+            ax3.set_ylabel("Absolute Geodesic Error", fontsize=self.config.label_fontsize)
+            ax3.set_title("Error Distribution by Phase", fontsize=self.config.title_fontsize)
+            ax3.grid(True, alpha=0.3, axis="y")
+            ax3.tick_params(axis="both", labelsize=self.config.tick_fontsize)
+            ax3.legend(fontsize=self.config.label_fontsize)
 
             plt.tight_layout()
 

@@ -94,6 +94,8 @@ class FucciCurveProjector:
         raise ValueError(f"Unsupported shape '{self.shape}' for FUCCI curve projector")
 
     def geodesic_distance(self, point1, point2, space="phase") -> float:
+        if isinstance(point1, np.ndarray) or isinstance(point2, np.ndarray):
+            return [self.geodesic_distance(p1, p2, space=space) for p1, p2 in zip(point1, point2)]
         if space == "phase":
             half_perimeter = 0.5
 

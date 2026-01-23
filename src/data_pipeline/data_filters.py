@@ -596,52 +596,16 @@ class ExpIDFilter(CellFilter):
         return f"ExpIDFilter({', '.join(parts)})"
 
 
-class CellDuplicatesFilter(CellFilter):
-    """Filter cells that are known duplicates based on similarity analysis."""
-
-    def __init__(self, duplicate_cell_ids: Optional[set] = None):
-        """
-        Args:
-            duplicate_cell_ids: Set of cell IDs to filter out. If None, uses the
-                              global CELL_DUPLICATES set defined in this module.
-        """
-        self.duplicate_cell_ids = (
-            duplicate_cell_ids if duplicate_cell_ids is not None else CELL_DUPLICATES
-        )
-
-    def __call__(self, cell_data) -> FilterResult:
-        cell_id = cell_data.metadata.get("cell_id")
-
-        if cell_id is None:
-            # Can't check without cell_id, let it pass
-            return FilterResult(is_valid=True)
-
-        # Convert to string for comparison (CELL_DUPLICATES contains strings)
-        cell_id_str = str(cell_id)
-
-        if cell_id_str in self.duplicate_cell_ids:
-            return FilterResult(
-                is_valid=False,
-                reason="cell_duplicate",
-                metadata={"cell_id": cell_id_str},
-            )
-
-        return FilterResult(is_valid=True)
-
-    def get_name(self) -> str:
-        return f"CellDuplicatesFilter(n_duplicates={len(self.duplicate_cell_ids)})"
-
-
 class CellDuplicateFilter(CellFilter):
     """Filter cells that are identified as duplicates based on similarity analysis."""
 
-    def __init__(self, duplicate_cell_ids: Optional[set] = None):
+    def __init__(self, duplicate_cell_ids: set = {}):
         """
         Args:
-            duplicate_cell_ids: Set of cell IDs to filter out. If None, uses the
+            duplicate_cell_ids: Set of cell IDs to filter out. If empty, uses the
                                 CELL_DUPLICATES set defined in this module.
         """
-        self.duplicate_cell_ids = duplicate_cell_ids or CELL_DUPLICATES
+        self.duplicate_cell_ids = duplicate_cell_ids  # or CELL_DUPLICATES
 
     def __call__(self, cell_data) -> FilterResult:
         cell_id = cell_data.metadata.get("cell_id")

@@ -90,10 +90,7 @@ class FeatureExtractor:
         # Mask the crop so we only analyze the cell/nucleus, not the background in the box
         cell_isolated = np.where(mask_crop == 0, cell_crop, 0)
 
-        # Rescale intensity for Haralick
-        # Haralick requires integer inputs and a small range (e.g., 0-255 or 0-63).
-        # If we use raw 16-bit (0-65535), the GLCM matrix is huge and computation fails.
-        # Here we convert to 8-bit (0-255).
+        # Rescale intensity for Haralick to 8-bit (0-255).
         if cell_isolated.max() > 0:
             scale_factor = 255 / cell_isolated.max()
             cell_8bit = (cell_isolated * scale_factor).astype(np.uint8)
@@ -110,16 +107,6 @@ class FeatureExtractor:
             f"haralick_entropy_{type}": mean_texture[8],
             f"haralick_correlation_{type}": mean_texture[2],
         }
-
-    def polynomial_transform(self, features: dict):
-        """Apply polynomial transformations to selected features"""
-        transformed_features = {}
-        for key, value in features.items():
-            if isinstance(value, (int, float)):
-                transformed_features[f"{key}^2"] = value**2
-                transformed_features[f"{key}^3"] = value**3
-
-        return transformed_features
 
     def extract_all_features(self, cell_data) -> Dict:
         """Extract all features for a single cell data dict.
