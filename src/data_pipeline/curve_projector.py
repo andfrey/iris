@@ -35,7 +35,6 @@ class FucciCurveProjector:
         self.dataset = dataset
         self.shape = shape
         # Learned artifacts after fit
-        self.centroid: Optional[np.ndarray] = None
         self.n1: Optional[np.ndarray] = None
         self.n2: Optional[np.ndarray] = None
         self.n3: Optional[np.ndarray] = None
@@ -50,48 +49,29 @@ class FucciCurveProjector:
     def fit(self, points) -> "FucciCurveProjector":
         print("⟳ Fitting FUCCI curve projector…")
         P = _as_points(points, self.feature_cols)
-        if self.shape == "circle":
-            self.centroid, self.radius = self._fit_cycle_center(P)
-            self.perimeter = 2 * np.pi
-        elif self.shape == "polygon":
-            (
-                self.n1,
-                self.n2,
-                self.n3,
-                self.n4,
-                self.c1,
-                self.c2,
-                self.c3,
-                self.c4,
-            ) = self._fit_polygon(P)
-            self.polygon_lines = self._compute_polygon_lines(
-                self.n1, self.n2, self.n3, self.n4, self.c1, self.c2, self.c3, self.c4
-            )
-            self.perimeter = compute_perimeter(self.polygon_lines)
-        else:
-            raise ValueError(f"Unsupported shape '{self.shape}' for FUCCI curve projector")
+        (
+            self.n1,
+            self.n2,
+            self.n3,
+            self.n4,
+            self.c1,
+            self.c2,
+            self.c3,
+            self.c4,
+        ) = self._fit_polygon(P)
+        self.polygon_lines = self._compute_polygon_lines(
+            self.n1, self.n2, self.n3, self.n4, self.c1, self.c2, self.c3, self.c4
+        )
+        self.perimeter = compute_perimeter(self.polygon_lines)
+
         return self
 
     def project(self, intensities) -> Tuple[float, np.ndarray]:
         """Project a single 2D intensity point onto the curve and return (phase, projected_point)."""
         self._ensure_fitted()
-        if self.shape == "circle":
-            phase = self.compute_phase(intensities)  # Shift to [0, 2π]
-            projected = self._phase_to_circle(phase, radius=self.radius)
-            phase = phase + np.pi  # Shift phase to [0, 2π]
-        elif self.shape == "polygon":
-            phase, projected = self._project_intensity_to_polygon(intensities)
-
+        phase, projected = self._project_intensity_to_polygon(intensities)
         phase = phase / self.perimeter
         return phase, projected
-
-    def get_perimeter(self) -> Tuple[float, float]:
-        if self.shape == "circle":
-            return 2 * np.pi
-        if self.shape == "polygon":
-            self._ensure_fitted()
-            return compute_perimeter(self.polygon_lines)
-        raise ValueError(f"Unsupported shape '{self.shape}' for FUCCI curve projector")
 
     def geodesic_distance(self, point1, point2, space="phase") -> float:
         if isinstance(point1, np.ndarray) or isinstance(point2, np.ndarray):
@@ -113,35 +93,15 @@ class FucciCurveProjector:
             return self.geodesic_distance(phase1, phase2, space="phase")
         raise ValueError(f"Unsupported space '{space}' for geodesic distance computation")
 
-    def compute_phase(self, point) -> float:
-        """Compute phases and projected points for an array of 2D intensity points."""
-
-        return np.arctan2(point[1] - self.centroid[1], point[0] - self.centroid[0])
-
     def phase_to_curve(self, phase) -> float:
         """Compute the phase from a point to the fitted curve."""
         self._ensure_fitted()
         phase = phase * self.perimeter
-        if self.shape == "circle":
-            return self._phase_to_circle(phase, radius=self.radius)
-        elif self.shape == "polygon":
-            return self._phase_to_polygon(phase)
-        else:
-            raise ValueError(f"Unsupported shape '{self.shape}' for FUCCI curve projector")
-
-    def _phase_to_circle(self, phase, radius=1) -> np.ndarray:
-        """Convert phase (angle) to circle coordinates."""
-        phase = phase - np.pi
-        return [
-            self.centroid[0] + radius * np.cos(phase),
-            self.centroid[1] + radius * np.sin(phase),
-        ]
+        return self._phase_to_polygon(phase)
 
     def _phase_to_polygon(self, phase) -> float:
         """Compute the phase from a point to the fitted polygon."""
         self._ensure_fitted()
-        perimeter = compute_perimeter(self.polygon_lines)
-        phase = phase % perimeter
         summed_phase = 0.0
         line_idx = 0
         if phase == 0:
@@ -343,35 +303,6 @@ class FucciCurveProjector:
 
         return n1, n2, n3, n4, c1, c2, c3, c4
 
-    @staticmethod
-    def _fit_cycle_center(points: np.ndarray) -> np.ndarray:
-        import numpy as np
-        from scipy import optimize
-
-        # Function to calculate distance from center (xc, yc) to each point
-        def calc_R(xc, yc, r):
-            return np.sqrt((points[:, 0] - xc) ** 2 + (points[:, 1] - yc) ** 2) - r
-
-        # Residual function: difference between each point's distance and mean distance (radius)
-        def residuals(c):
-            Ri = calc_R(*c)
-            return Ri
-
-        # Initial guess: mean of points as center
-        center_estimate = np.mean(points, axis=0)
-        radius_estimate = np.mean(
-            np.sqrt(
-                (points[:, 0] - center_estimate[0]) ** 2 + (points[:, 1] - center_estimate[1]) ** 2
-            )
-        )
-        initial_guess = (center_estimate[0], center_estimate[1], radius_estimate)
-
-        # Least squares optimization to find center
-        (center_x, center_y, radius), ier = optimize.leastsq(residuals, initial_guess)
-        centroid = np.array([center_x, center_y])
-        radius = radius
-        return centroid, radius
-
     # -----------------------------
     # Plotting helpers
     # -----------------------------
@@ -392,24 +323,13 @@ class FucciCurveProjector:
             intensity_points: Optional array-like of shape (N,2) to plot as gray points
             plot_random_projections: Whether to add random points and plot their projections to the curve
         """
-        if self.shape == "circle":
-            return self.plot_circle(
-                ax=ax,
-                show=show,
-                lw=lw,
-                intensity_points=intensity_points,
-                plot_random_projections=plot_random_projections,
-            )
-        elif self.shape == "polygon":
-            return self.plot_polygon(
-                ax=ax,
-                show=show,
-                lw=lw,
-                intensity_points=intensity_points,
-                plot_random_projections=plot_random_projections,
-            )
-        else:
-            raise ValueError(f"Unsupported shape '{self.shape}' for FUCCI curve projector")
+        return self.plot_polygon(
+            ax=ax,
+            show=show,
+            lw=lw,
+            intensity_points=intensity_points,
+            plot_random_projections=plot_random_projections,
+        )
 
     def plot_polygon(
         self,
@@ -446,16 +366,7 @@ class FucciCurveProjector:
         c2 = self.c2
         c3 = self.c3
         c4 = self.c4
-        print(f"polygon parameters:")
-        print(f"  n1: {n1}")
-        print(f"  n2: {n2}")
-        print(f"  n3: {n3}")
-        print(f"  n4: {n4}")
-        print(f"  c1: {c1:.1f}")
-        print(f"  c2: {c2:.1f}")
-        print(f"  c3: {c3:.1f}")
-        print(f"  c4: {c4:.1f}")
-        print(f" Cutting points:")
+
         ax = ax or plt.gca()
 
         # Estimate a suitable scale based on the data range
@@ -503,11 +414,6 @@ class FucciCurveProjector:
                 "-",
                 color="black",
                 lw=lw,
-                # label=(
-                #     f"Edge {i+1} (θ={angle_deg:.1f}°)"
-                #     if i == 0
-                #     else f"Edge {i+1} (θ={angle_deg:.1f}°)"
-                # ),
             )
             ax.plot(
                 self.polygon_lines[i][:, 0],
@@ -517,10 +423,6 @@ class FucciCurveProjector:
                 lw=lw,
             )
 
-        print(f"  {self.polygon_lines[0][0]}")
-        print(f"  {self.polygon_lines[1][0]}")
-        print(f"  {self.polygon_lines[2][0]}")
-        print(f"  {self.polygon_lines[3][0]}")
         # Plot intensity points if provided
         if intensity_points is not None:
             ax.scatter(
@@ -568,132 +470,8 @@ class FucciCurveProjector:
 
         return ax
 
-    def plot_circle(
-        self,
-        ax=None,
-        show: bool = True,
-        color: str = "crimson",
-        lw: float = 2.0,
-        intensity_points: Optional[np.ndarray] = None,
-        plot_random_projections: bool = False,
-    ):
-        """Plot the fitted reference circle.
-
-        Args:
-            ax: Matplotlib Axes; if None, uses current axes
-            show: Call plt.show() when done
-            color: Line color for the circle
-            lw: Line width for the circle
-            intensity_points: Optional array-like of shape (N,2) to plot as gray points
-            plot_random_projections: Whether to add random points and plot their projections to the circle
-
-        Returns:
-            The Matplotlib Axes with the plot
-        """
-        import matplotlib.pyplot as plt
-
-        self._ensure_fitted()
-        radius = self.radius
-        ax = ax or plt.gca()
-        theta = np.linspace(0, 2 * np.pi, 100)
-        x = self.centroid[0] + radius * np.cos(theta)
-        y = self.centroid[1] + radius * np.sin(theta)
-
-        ax.plot(
-            x,
-            y,
-            "-",
-            color=color,
-            lw=lw,
-            label="Fitted Circle",
-        )
-        ax.scatter(
-            self.centroid[0], self.centroid[1], c="black", marker="x", s=60, label="Centroid"
-        )
-
-        # Add phase annotations around the circle
-        phase_labels = [
-            (0, "0"),
-            (np.pi / 4, "π/4"),
-            (np.pi / 2, "π/2"),
-            (3 * np.pi / 4, "3π/4"),
-            (np.pi, "π"),
-            (-np.pi / 2, "-π/2"),
-            (-np.pi / 4, "-π/4"),
-            (-3 * np.pi / 4, "-3π/4"),
-        ]
-
-        for phase, label in phase_labels:
-            # Position on the circle
-            px = self.centroid[0] + radius * np.cos(phase)
-            py = self.centroid[1] + radius * np.sin(phase)
-
-            # Offset for text (slightly outside the circle)
-            text_offset = 1.2
-            tx = self.centroid[0] + radius * text_offset * np.cos(phase)
-            ty = self.centroid[1] + radius * text_offset * np.sin(phase)
-
-            # Plot marker on circle
-            ax.scatter(px, py, c="blue", marker="o", s=40, zorder=5)
-
-            # Add text label
-            ax.text(
-                tx,
-                ty,
-                label,
-                fontsize=10,
-                ha="center",
-                va="center",
-                bbox=dict(boxstyle="round,pad=0.3", facecolor="white", edgecolor="black", alpha=1),
-            )
-
-        if intensity_points is not None:
-            pts = _as_points(intensity_points, self.feature_cols)
-            pts = pts[(pts[:, 0] >= 0) & (pts[:, 1] >= 0)]
-            ax.scatter(
-                pts[:, 0],
-                pts[:, 1],
-                s=10,
-                c="gray",
-                alpha=0.5,
-                label="Intensity points",
-            )
-            if plot_random_projections:
-                rng = np.random.default_rng(42)
-                n_rand = min(len(intensity_points), 50)
-                rand_pts = rng.choice(range(0, len(intensity_points)), size=n_rand, replace=False)
-                for pt in rand_pts:
-                    phase, _ = self.project(intensity_points[pt])
-                    projection = self.phase_to_curve(phase)
-                    ax.plot(
-                        [intensity_points[pt][0], projection[0]],
-                        [intensity_points[pt][1], projection[1]],
-                        "b--",
-                        lw=1,
-                        alpha=0.7,
-                    )
-                    ax.scatter(
-                        [intensity_points[pt][0]],
-                        [intensity_points[pt][1]],
-                        c="blue",
-                        s=30,
-                        marker="o",
-                        label=None,
-                    )
-        #             ax.scatter([projected[0]], [projected[1]], c="red", s=30, marker="x", label=None)
-        ax.set_aspect("equal", adjustable="box")
-        ax.set_xlabel("FUCCI 488nm intensity")
-        ax.set_ylabel("FUCCI 561nm intensity")
-        ax.legend(loc="best")
-        if show:
-            plt.show()
-        return ax
-
     def _ensure_fitted(self):
-        # if self.curve_points is None or self._interp_x is None or self._interp_y is None:
-        if self.shape == "circle" and self.centroid is None:
-            self.fit_from_dataset()
-        elif self.shape == "polygon" and self.polygon_lines is None:
+        if self.polygon_lines is None:
             self.fit_from_dataset()
 
     def _extract_points_from_dataset(self, dataset: Any, n_workers: int = -1) -> np.ndarray:
@@ -726,54 +504,31 @@ class FucciCurveProjector:
             except Exception as e:
                 return (None, f"Index {idx}: {str(e)}")
 
-        # Check if dataset supports indexing
-        has_len = hasattr(dataset, "__len__")
-        has_getitem = hasattr(dataset, "__getitem__")
+        n_samples = len(dataset)
 
-        if has_len and has_getitem:
-            n_samples = len(dataset)
+        # Use joblib for parallel processing with progress bar
+        results = Parallel(n_jobs=n_workers, verbose=0, backend="loky")(
+            delayed(extract_single_sample)(idx)
+            for idx in tqdm(range(n_samples), desc="Extracting FUCCI intensities")
+        )
 
-            # Use joblib for parallel processing with progress bar
-            results = Parallel(n_jobs=n_workers, verbose=0, backend="loky")(
-                delayed(extract_single_sample)(idx)
-                for idx in tqdm(range(n_samples), desc="Extracting FUCCI intensities")
-            )
+        pts_list = []
+        errors = []
 
-            pts_list = []
-            errors = []
+        for arr, error in results:
+            if error is None:
+                pts_list.append(arr)
+            else:
+                errors.append(error)
 
-            for arr, error in results:
-                if error is None:
-                    pts_list.append(arr)
-                else:
-                    errors.append(error)
+        if errors:
+            print(f"\nWarning: Failed to extract intensities for {len(errors)} samples:")
+            for error in errors[:10]:  # Show first 10 errors
+                print(f"  - {error}")
+            if len(errors) > 10:
+                print(f"  ... and {len(errors) - 10} more errors")
 
-            if errors:
-                print(f"\nWarning: Failed to extract intensities for {len(errors)} samples:")
-                for error in errors[:10]:  # Show first 10 errors
-                    print(f"  - {error}")
-                if len(errors) > 10:
-                    print(f"  ... and {len(errors) - 10} more errors")
-
-            return np.stack(pts_list, axis=0)
-        else:
-            # Fallback for datasets without indexing support
-            def extract_label(sample):
-                if isinstance(sample, tuple):
-                    labels = sample[-1]
-                else:
-                    raise ValueError(
-                        "Each dataset item must be a tuple ending with labels of shape (2,)"
-                    )
-                arr = np.asarray(labels, dtype=float).reshape(-1)
-                if arr.shape[0] != 2:
-                    raise ValueError(f"Expected label shape (2,) for (488,561), got {arr.shape}")
-                return arr
-
-            pts_list = []
-            for sample in tqdm(dataset, desc="Extracting FUCCI intensities from dataset"):
-                pts_list.append(extract_label(sample))
-            return np.stack(pts_list, axis=0)
+        return np.stack(pts_list, axis=0)
 
 
 def _as_points(points_like, feature_cols: Tuple[str, str]) -> np.ndarray:

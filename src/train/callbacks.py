@@ -5,7 +5,6 @@ import numpy as np
 from lightning.pytorch.callbacks import Callback
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
-from src.train.utils import log_regression_plots
 from src.evaluation.evaluator import Evaluator, EvaluationConfig
 
 
@@ -116,12 +115,6 @@ class EvaluationCallback(Callback):
         if trainer.logger is not None:
             result.log_to_wandb(trainer.logger.experiment, prefix="train")
 
-        # log_regression_plots(
-        #     y_true,
-        #     y_pred,
-        #     trainer.logger.experiment,
-        #     "train",
-        # )
         # Clear storage
         self.train_outputs = []
 
@@ -142,12 +135,6 @@ class EvaluationCallback(Callback):
         if trainer.logger is not None:
             result.log_to_wandb(trainer.logger.experiment, prefix="val")
 
-        # log_regression_plots(
-        #     y_true,
-        #     y_pred,
-        #     trainer.logger.experiment,
-        #     "val",
-        # )
         pl_module.val_predictions = []
         pl_module.val_targets = []
 
@@ -171,12 +158,7 @@ class EvaluationCallback(Callback):
         # Log to W&B
         if trainer.logger is not None:
             result.log_to_wandb(trainer.logger.experiment, prefix="test")
-        # log_regression_plots(
-        #     y_true,
-        #     y_pred,
-        #     trainer.logger.experiment,
-        #     "test",
-        # )
+
         pl_module.test_predictions = []
         pl_module.test_targets = []
 

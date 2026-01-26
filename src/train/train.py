@@ -68,8 +68,6 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 from src.models.cnet import CNet, ABSResiduals
 from src.models.mlp import MLP
 from src.evaluation.evaluator import Evaluator
-from src.train.utils import log_regression_plots
-from src.models.xgboost_trainer import XGBoostCellCycleTrainer
 from src.data_pipeline.dataset import (
     ModularCellDataModule,
     ModularCellFeaturesDataset,
@@ -86,8 +84,6 @@ FILE_DIR_PATH = Path(__file__).resolve().parent
 MODELS = {
     "CNet": CNet,
     "MLP": MLP,
-    "Ridge": Ridge,
-    "Lasso": Lasso,
 }
 
 
@@ -99,12 +95,9 @@ def parse_args():
         Parsed arguments
     """
     parser = argparse.ArgumentParser(
-        description="Train/evaluate cell cycle prediction models with selectable backends",
+        description="Train cell cycle prediction models",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-
-    # Top-level subparsers for backend selection
-    subparsers = parser.add_subparsers(dest="backend", required=True)
 
     # Common parser for both backends to hold config file args
     common_parser = argparse.ArgumentParser(add_help=False)
@@ -127,68 +120,11 @@ def parse_args():
         help="Experiment name",
     )
 
-    # Lightning backend
-    lightning_parser = subparsers.add_parser(
-        "lightning",
-        parents=[common_parser],
-        help="Train with PyTorch Lightning and evaluate on validation/test sets",
-    )
-    lightning_parser.add_argument(
+    common_parser.add_argument(
         "--holdout-exp-id",
         type=str,
         default=None,
         help="Experiment ID to hold out for testing (leave-one-experiment-out)",
-    )
-
-    # XGBoost backend
-    xgb_parser = subparsers.add_parser(
-        "xgboost",
-        parents=[common_parser],
-        help="Train with XGBoost and evaluate on validation/test sets",
-    )
-
-    # Linear regression backend
-    linear_parser = subparsers.add_parser(
-        "linear",
-        parents=[common_parser],
-        help="Train with Linear Regression (sklearn) and evaluate on validation/test sets",
-    )
-
-    linear_parser.add_argument(
-        "--tune",
-        action="store_true",
-        help="Run hyperparameter sweep with W&B instead of single training run",
-    )
-    linear_parser.add_argument(
-        "--sweep-config",
-        type=str,
-        default=None,
-        help="Path to W&B sweep configuration YAML (used with --tune)",
-    )
-    linear_parser.add_argument(
-        "--count",
-        type=int,
-        default=None,
-        help="Number of sweep trials to run (used with --tune, default: run until stopped)",
-    )
-
-    # Add tune flag for XGBoost hyperparameter sweep
-    xgb_parser.add_argument(
-        "--tune",
-        action="store_true",
-        help="Run hyperparameter sweep with W&B instead of single training run",
-    )
-    xgb_parser.add_argument(
-        "--sweep-config",
-        type=str,
-        default=None,
-        help="Path to W&B sweep configuration YAML (used with --tune)",
-    )
-    xgb_parser.add_argument(
-        "--count",
-        type=int,
-        default=None,
-        help="Number of sweep trials to run (used with --tune, default: run until stopped)",
     )
 
     return parser.parse_args()
@@ -351,302 +287,6 @@ def run_lightning(
     return trainer
 
 
-###################################################################
-######                  XGBoost part                         ######
-###################################################################
-
-
-def xgboost_training_setup(
-    data_config: str,
-    wandb_run: Optional[wandb.sdk.wandb_run.Run] = None,
-):
-    """
-    Initialize XGBoostCellCycleTrainer and split data for XGBoost workflow.
-
-    Args:
-        data_config: Data configuration dictionary
-        wandb_run: Optional W&B run object
-
-    Returns:
-        trainer: XGBoostCellCycleTrainer instance
-        train_df: Training DataFrame
-        test_df: Test DataFrame
-    """
-
-    dataset = ModularCellFeaturesDataset(data_config=data_config)
-    evaluator = Evaluator(projector=dataset.projector)
-    train_df, val_df, test_df = dataset.split_set()
-
-    trainer = XGBoostCellCycleTrainer(
-        training_data=train_df,
-        val_data=val_df,
-        evaluator=evaluator,
-        wandb_run=wandb_run,
-        dataset=dataset,
-    )
-    return trainer, test_df, dataset
-
-
-def train_and_evaluate_xgboost(
-    params: Optional[Dict[str, Any]],
-    trainer: XGBoostCellCycleTrainer,
-    wandb_run: wandb.sdk.wandb_run.Run,
-    model_suffix: str = "",
-    save_model: bool = True,
-    test_X=None,
-    test_y=None,
-):
-    """
-    Unified XGBoost training and evaluation logic for both normal and sweep modes.
-
-    Args:
-        params: XGBoost hyperparameters (dict)
-        trainer: XGBoostCellCycleTrainer instance
-        wandb_run: W&B run object for logging
-        model_suffix: Suffix to append to model filename (e.g., for sweeps)
-        save_model: Whether to save the trained model to disk
-        test_df: Optional test DataFrame for evaluation
-
-    Returns:
-        trainer: The fitted XGBoostCellCycleTrainer instance
-        metrics: Validation metrics dictionary
-        test_metrics: Test metrics dictionary (if test_df provided)
-        model_path: Path to saved model (if saved)
-    """
-
-    if wandb_run:
-        trainer.set_wandb_run(wandb_run)
-    print("\nTraining XGBoost model...")
-    model, metrics = trainer.train(params=params)
-    model_path = None
-    # if save_model:
-    #     model_path = f"checkpoints/xgboost/xgboost{model_suffix}_val_r2_{metrics['val_r2']:.4f}_val_mae_{metrics['val_mae']:.4f}.json"
-    #     os.makedirs(os.path.dirname(model_path), exist_ok=True)
-    #     trainer.save_model(model_path)
-
-    if test_X is not None and test_y is not None:
-        test_evaluation = trainer.evaluator.evaluate(
-            test_y.squeeze(),
-            trainer.predict(test_X),
-            prefix="test",
-        )
-        print(f"\nTest Metrics:")
-        for k, v in test_evaluation.metrics.to_dict(prefix="test").items():
-            print(f"  {k}: {v}")
-    else:
-        test_evaluation = None
-
-    if model_path:
-        print(f"\n✓ Model saved to {model_path}")
-    # Log model as artifact
-    # artifact = wandb.Artifact(
-    #     name=f"xgboost-model-{wandb_run.id}",
-    #     type="model",
-    #     description=f"XGBoost model from sweep trial {wandb_run.name}",
-    # )
-    # artifact.add_file(str(model_path))
-    # wandb_run.log_artifact(artifact)
-    return trainer, metrics, test_evaluation.metrics.to_dict(prefix="test"), model_path
-
-
-def run_xgboost(config: dict, project_name: str):
-    """
-    Run XGBoost training/validation/testing using unified logic.
-
-    Args:
-        config: Dictionary containing 'data_config' and 'model_config' sections
-        project_name: W&B project name
-    """
-
-    data_config = config.get("data", {})
-    model_config = config.get("model", {})
-    run = wandb.init(project=project_name, config=config)
-    trainer, test_df, dataset = xgboost_training_setup(
-        data_config=data_config,
-    )
-    test_X, test_y = dataset.split_X_y(test_df)
-    train_and_evaluate_xgboost(
-        params=model_config,
-        trainer=trainer,
-        test_X=test_X,
-        test_y=test_y,
-        wandb_run=run,
-        save_model=True,
-        model_suffix=f"_sweep_{run.id}",
-    )
-    print("\n" + "=" * 80)
-    print("RUN COMPLETE")
-    print("=" * 80)
-
-
-def run_xgboost_tune(
-    config: dict,
-    sweep_config: dict,
-    project_name: str,
-    count: Optional[int] = None,
-):
-    """
-    Run W&B hyperparameter sweep for XGBoost using unified logic for each trial.
-
-    Args:
-        config: Dictionary containing 'data' section
-        sweep_config: W&B sweep configuration dictionary
-        project_name: W&B project name
-        count: Number of sweep trials to run
-    """
-
-    # Extract project name and count from sweep config
-    project_name = project_name or sweep_config.get("project", "xgboost-cell-cycle-sweep")
-    count = count or sweep_config.get("count", 10)
-
-    print("\n" + "=" * 80)
-    print("INITIALIZING W&B SWEEP")
-    print("=" * 80)
-    print(f"Project: {project_name}")
-    print(f"Trial count: {count if count else 'unlimited'}")
-    print("=" * 80 + "\n")
-
-    # Load data once (reuse for all trials)
-    print("Loading data (will be reused across trials)...")
-    data_config = config.get("data", {})
-
-    trainer, test_df, dataset = xgboost_training_setup(
-        data_config=data_config,
-    )
-    test_X, test_y = dataset.split_X_y(test_df)
-
-    def train_trial():
-        with wandb.init(project=project_name, config=data_config) as run:
-            # Use unified function
-            train_and_evaluate_xgboost(
-                params=run.config,
-                trainer=trainer,
-                test_X=test_X,
-                test_y=test_y,
-                wandb_run=run,
-                save_model=True,
-                model_suffix=f"_sweep_{run.id}",
-            )
-
-    # Initialize sweep
-    sweep_id = wandb.sweep(sweep=sweep_config, project=project_name)
-
-    print(f"\nSweep initialized: {sweep_id}")
-    print("\nStarting sweep trials...\n")
-
-    # Run sweep agent with the training function
-    wandb.agent(sweep_id, function=train_trial, count=count or 10, project=project_name)
-
-    print("\n" + "=" * 80)
-    print("SWEEP COMPLETE")
-    print("=" * 80)
-
-
-################################################################
-######               Linear Regression part                ######
-################################################################
-
-
-def run_linear_regression(
-    config: dict,
-    sweep: bool = False,
-    sweep_config: dict = None,
-    project_name: str = None,
-    count: int = None,
-):
-    """
-    Train and evaluate a lasso regression model using sklearn, with optional W&B sweep.
-    """
-    import pandas as pd
-    from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
-    from src.data_pipeline.dataset import ModularCellFeaturesDataset
-
-    # Load training data
-    data_config = config["data"]
-    model_config = config.get("model", {})
-    model_name = config.get("model_name")
-    model = MODELS[model_name]
-
-    count = count or sweep_config.get("count", 10) if sweep and sweep_config else None
-    dataset = ModularCellFeaturesDataset(data_config=data_config)
-    train_df, val_df, test_df = dataset.split_set()
-    feature_names = [
-        column for column in train_df.columns.tolist() if not column.startswith("label_")
-    ]
-    X_train, y_train = dataset.split_X_y(train_df)
-    X_val, y_val = dataset.split_X_y(val_df)
-    X_test, y_test = dataset.split_X_y(test_df)
-
-    evaluator = Evaluator()
-
-    def train_trial(trial_config, wandb_run, model=model):
-        # Use config from W&B sweep
-        params = trial_config
-        alpha = params.get("alpha")
-        model = model(alpha=alpha)
-        model.fit(X_train, y_train)
-        print("Model:", model)
-        val_preds = model.predict(X_val)
-        train_preds = model.predict(X_train)
-        metrics = {}
-        train_evaluation = evaluator.evaluate(
-            y_train,
-            train_preds,
-            prefix="train",
-        )
-        metrics.update(train_evaluation.metrics.to_dict(prefix="train"))
-        val_evaluation = evaluator.evaluate(
-            y_val,
-            val_preds,
-            prefix="val",
-        )
-
-        metrics.update(val_evaluation.metrics.to_dict(prefix="val"))
-        test_evaluation = evaluator.evaluate(
-            y_test,
-            model.predict(X_test),
-            prefix="test",
-        )
-        metrics.update(test_evaluation.metrics.to_dict(prefix="test"))
-        importance = np.abs(model.coef_)
-        importance_df = pd.DataFrame(
-            data=importance,
-            columns=feature_names,
-            index=["488", "561"],
-        )
-        wandb.log(**metrics)
-        for plot_name, fig in train_evaluation.plots.items():
-            wandb_run.log({f"{plot_name}": wandb.Image(fig)})
-            fig.clf()
-        for plot_name, fig in val_evaluation.plots.items():
-            wandb_run.log({f"{plot_name}": wandb.Image(fig)})
-            fig.clf()
-        print(f"{model_name} Regression Validation Results:")
-        print(f"MSE: {metrics['val_mse']:.4f}")
-        print(f"MAE: {metrics['val_mae']:.4f}")
-        print(f"R2: {metrics['val_r2']:.4f}")
-        print(f"\nTest Metrics:")
-        for k, v in test_evaluation.metrics.to_dict(prefix="test").items():
-            print(f"  {k}: {v:.4f}")
-
-    if sweep and sweep_config is not None:
-        # W&B sweep
-        project_name = sweep_config.get("project") or project_name
-        sweep_id = wandb.sweep(sweep=sweep_config, project=project_name)
-        print(f"Sweep initialized: {sweep_id}")
-        print("Starting sweep trials...")
-
-        def wandb_train():
-            with wandb.init(project=project_name, config=data_config) as run:
-                train_trial(run.config, wandb_run=run, model=model)
-
-        wandb.agent(sweep_id, function=wandb_train, count=count or 10, project=project_name)
-        print("SWEEP COMPLETE")
-    else:
-        wandb.init(project=project_name, config=config)
-        train_trial(trial_config=model_config, wandb_run=wandb.run, model=model)
-
-
 def main():
     """
     Entry point for the script.
@@ -654,55 +294,15 @@ def main():
     """
     args = parse_args()
 
-    # Dispatch to appropriate backend
-    print("\n" + "=" * 80)
-    print("SELECTED MODE")
-    print("=" * 80)
-    print(f"Backend: {args.backend}")
-    if args.backend == "xgboost" and args.tune:
-        print(f"Mode: Hyperparameter Tuning")
-        print(f"Sweep config:   {args.sweep_config}")
-    print("=" * 80 + "\n")
-
     config = load_config(args.config)
 
-    project_name = args.project
-    experiment_name = args.experiment_name
-    if args.backend == "lightning":
-        holdout_exp_id = getattr(args, "holdout_exp_id", None)
-        run_lightning(
-            config,
-            project_name=project_name,
-            experiment_name=experiment_name,
-            holdout_exp_id=holdout_exp_id,
-        )
-    elif args.backend == "xgboost":
-        if args.tune:
-            # Run hyperparameter sweep
-            sweep_config = load_config(args.sweep_config)
-            run_xgboost_tune(
-                config,
-                sweep_config=sweep_config,
-                project_name=args.project,
-                count=args.count,
-            )
-        else:
-            # Run fit (which includes validation and test evaluation)
-            run_xgboost(config, project_name)
-    elif args.backend == "linear":
-        if getattr(args, "tune", False):
-            sweep_config = load_config(args.sweep_config)
-            run_linear_regression(
-                config,
-                sweep=True,
-                sweep_config=sweep_config,
-                project_name=args.project or "linear-cell-cycle",
-                count=args.count,
-            )
-        else:
-            run_linear_regression(config)
-    else:
-        raise ValueError(f"Unknown backend: {args.backend}")
+    holdout_exp_id = getattr(args, "holdout_exp_id", None)
+    run_lightning(
+        config,
+        project_name=project_name,
+        experiment_name=experiment_name,
+        holdout_exp_id=holdout_exp_id,
+    )
 
 
 if __name__ == "__main__":

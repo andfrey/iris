@@ -42,7 +42,6 @@ class FilterConfig:
     allowed_exp_ids: Optional[List[str]] = None
     excluded_exp_ids: Optional[List[str]] = field(default_factory=lambda: ["NG012"])
     duplicate_cell_ids: Optional[List[str]] = None  # Filter out known duplicate cells by default
-    filter_duplicates: bool = True  # Filter out known duplicate cells by default
 
 
 @dataclass

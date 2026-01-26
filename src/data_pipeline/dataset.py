@@ -24,8 +24,8 @@ from .utils import (
     load_parquet_cache,
     make_hash_from_dict,
 )
-from .data_sources import DataSource, CellData, DataSourceConfig, create_data_source_from_config
-from .data_transforms import Transform, create_transform_pipeline_from_config
+from .data_sources import CellData, DataSourceConfig, create_data_source_from_config
+from .data_transforms import create_transform_pipeline_from_config
 from .feature_extractor import FeatureExtractor, polynomial_transform
 from .curve_projector import FucciCurveProjector
 
@@ -191,6 +191,7 @@ class ModularCellDataModule(L.LightningDataModule):
         else:
             self.full_dataset = ModularCellImageDataset(self.config)
 
+        # create test datasest from hold_out_exp_id or random
         if self.config.hold_out_exp_id is not None:
             self.test_dataset = deepcopy(self.full_dataset)
             exp_id_filtered_config = deepcopy(self.config)
@@ -220,7 +221,6 @@ class ModularCellDataModule(L.LightningDataModule):
             print(f"   ✓ Train/Val: {len(train_indices) + len(val_indices):,} samples")
             print(f"   ✓ Test:      {len(test_indices):,} samples")
         else:
-            # Split with generator for reproducibility
             self.train_dataset, self.val_dataset, self.test_dataset = split_dataset(
                 self.full_dataset, self.config.data_split, self.config.seed
             )
@@ -305,8 +305,7 @@ class ModularCellImageDataset(BaseCellDataset):
         # Flag toggled by the DataModule to ensure augmentation is applied only on the train split
         self.apply_augmentation = False
         super().__init__(data_config=data_config)
-        # Build an optional torchvision-based augmentation pipeline from config
-        # self.augmentation_transform = self.create_albumentations_transform() #self.create_augmentation_transform()
+
         self.augmentation_transform = self.create_augmentation_transform()
         self.use_memory_cache = use_memory_cache
         if self.use_memory_cache:
@@ -383,69 +382,6 @@ class ModularCellImageDataset(BaseCellDataset):
             print(f"⚠ Augmentation failed: {e}")
             return images_tensor
 
-    def create_albumentations_transform(self):
-        """Create fast Albumentations augmentation pipeline."""
-        aug_dict = self.config.augmentations
-        if aug_dict is None:
-            return None
-
-        transforms_list = []
-
-        for name, params in aug_dict.items():
-            params = params if params else {}
-
-            if name == "RandomHorizontalFlip":
-                p = params.get("p", 0.5)
-                transforms_list.append(A.HorizontalFlip(p=p))
-
-            elif name == "RandomVerticalFlip":
-                p = params.get("p", 0.5)
-                transforms_list.append(A.VerticalFlip(p=p))
-
-            elif name == "RandomRotation":
-                degrees = params.get("degrees", 360)
-                p = params.get("p", 1.0)
-                # Albumentations uses limit as max rotation in either direction
-                if isinstance(degrees, (int, float)):
-                    limit = degrees
-                else:
-                    limit = max(abs(degrees[0]), abs(degrees[1]))
-                transforms_list.append(A.Rotate(limit=limit, p=p, border_mode=0))
-
-            elif name == "RandomAffine":
-                transforms_list.append(
-                    A.Affine(
-                        rotate=params.get("degrees", 0),
-                        translate_percent=params.get("translate"),
-                        scale=params.get("scale"),
-                        shear=params.get("shear"),
-                        p=params.get("p", 1.0),
-                    )
-                )
-
-            elif name == "GaussianBlur":
-                transforms_list.append(
-                    A.GaussianBlur(
-                        blur_limit=params.get("kernel_size", (3, 7)),
-                        sigma_limit=params.get("sigma", (0.1, 2.0)),
-                        p=params.get("p", 0.5),
-                    )
-                )
-
-            elif name == "RandomBrightnessContrast":
-                transforms_list.append(
-                    A.RandomBrightnessContrast(
-                        brightness_limit=params.get("brightness", 0.2),
-                        contrast_limit=params.get("contrast", 0.2),
-                        p=params.get("p", 0.5),
-                    )
-                )
-
-        if not transforms_list:
-            return None
-
-        return A.Compose(transforms_list)
-
     def create_augmentation_transform(self):
         """Create a torchvision.transforms pipeline from self.config."""
         aug_dict = self.config.augmentations
@@ -477,15 +413,16 @@ class ModularCellImageDataset(BaseCellDataset):
 
 class ModularCellImageFeatureDataset(ModularCellImageDataset):
     """
-    Dataset that returns selected images, transformed features, and fucci labels for each cell.
+    Dataset that returns selected images, features, and fucci labels for each cell inheriting the
+    image retrieving from ModularCellImageDataset and uses ModularCellFeaturesDataset as class
+    attribute to retrieve the respective feature for a cell.
     """
 
     def __init__(self, data_config: DataSetConfig):
         if isinstance(data_config, dict):
             data_config = DataSetConfig(**data_config)
 
-        # feature_data_config = deepcopy(data_config)
-        # feature_data_config.image_transforms = []
+        # load extracted features through ModularCellFeaturesDataset
         self.feature_dataset = ModularCellFeaturesDataset(data_config=data_config)
         super().__init__(data_config=data_config)
         assert (
